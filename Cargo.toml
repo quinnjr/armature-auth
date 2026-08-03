@@ -67,6 +67,7 @@ webauthn = ["dep:webauthn-rs"]
 full = ["saml", "two-factor", "webauthn"]
 
 [dev-dependencies]
+cargo-husky = { version = "1.5", default-features = false, features = ["user-hooks"] }
 armature-testkit = { path = "../armature-testkit" }
 tokio-test = "0.4"
 # Note: SAML tests require the `saml` feature to be enabled
