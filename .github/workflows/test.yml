@@ -13,13 +13,24 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+      # `--all-features` turns on optional integrations whose build scripts
+      # shell out to system libraries. Without these the build fails before it
+      # reaches any Rust of ours.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxml2-dev libxmlsec1-dev libxmlsec1-openssl pkg-config
       # `armature-testkit` is `publish = false`, so this crate's dev-dependency on
       # it cannot come from the registry. It is the one sibling that still has to
       # be present on disk; everything else resolves from crates.io.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           repository: quinnjr/armature-testkit
+          # Pinned: without a ref this takes whatever the default branch holds
+          # at the moment the job starts, which made four repos fail when their
+          # workflows ran before testkit's own push had landed.
+          ref: develop
           path: armature-testkit
       - name: Move the checkout beside this crate
         run: |
@@ -34,13 +45,17 @@ jobs:
     name: MSRV 1.94.1
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # `armature-testkit` is `publish = false`, so this crate's dev-dependency on
       # it cannot come from the registry. It is the one sibling that still has to
       # be present on disk; everything else resolves from crates.io.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           repository: quinnjr/armature-testkit
+          # Pinned: without a ref this takes whatever the default branch holds
+          # at the moment the job starts, which made four repos fail when their
+          # workflows ran before testkit's own push had landed.
+          ref: develop
           path: armature-testkit
       - name: Move the checkout beside this crate
         run: |
