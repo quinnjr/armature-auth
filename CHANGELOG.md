@@ -9,6 +9,10 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+### Added
+
+- Adopted the `auth` criterion benchmark (password hashing, API keys, guards, OAuth2, session IDs) from the root package's `benches/`. Run it with `cargo bench -p armature-auth --bench auth`. The crate now sets `autobenches = false`, so a new file under `benches/` needs an explicit `[[bench]]` entry.
+
 ### Fixed
 
 - **Breaking:** `SamlConfig::allow_idp_initiated` defaults to `false`, and `validate_response_with_request_id` correlates `InResponseTo` and RelayState. The generated RelayState was previously handed to the caller and never checked, leaving SSO login-CSRF and unsolicited-response replay open.
