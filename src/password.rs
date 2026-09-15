@@ -3,9 +3,7 @@
 use crate::{AuthError, Result};
 use argon2::{
     Argon2,
-    password_hash::{
-        PasswordHash, PasswordHasher as _, PasswordVerifier as _, SaltString, rand_core::OsRng,
-    },
+    password_hash::{PasswordHasher as _, PasswordVerifier as _, phc::PasswordHash},
 };
 
 /// Password hashing algorithm
@@ -82,11 +80,12 @@ impl PasswordHasher {
 
     /// Hash with argon2
     fn hash_argon2(&self, password: &str) -> Result<String> {
-        let salt = SaltString::generate(&mut OsRng);
+        // `hash_password` draws a 16-byte (RECOMMENDED_SALT_LEN) salt from the OS RNG via
+        // getrandom, matching the salt argon2 0.5's `SaltString::generate(&mut OsRng)` produced.
         let argon2 = Argon2::default();
 
         let password_hash = argon2
-            .hash_password(password.as_bytes(), &salt)
+            .hash_password(password.as_bytes())
             .map_err(|e| AuthError::PasswordHashError(e.to_string()))?;
 
         Ok(password_hash.to_string())
@@ -154,6 +153,58 @@ mod tests {
 
         assert!(hasher.verify(password, &hash).unwrap());
         assert!(!hasher.verify("wrong-password", &hash).unwrap());
+    }
+
+    /// A PHC string produced by argon2 0.5 (`Argon2::default()`, 16-byte salt) before the
+    /// upgrade to argon2 0.6. Stored hashes must keep verifying across the dependency bump.
+    const ARGON2_0_5_FIXTURE: &str = "$argon2id$v=19$m=19456,t=2,p=1$nH0iQJbueCWq5JnfvSpiJw$roc61cxbzQ5B3f0VWGYnMPlFFP7YkK7C8DZnDLpbD1o";
+
+    #[test]
+    fn test_argon2_verifies_hash_from_previous_version() {
+        let verifier = PasswordHasher::default();
+        assert!(
+            verifier
+                .verify("correct horse battery staple", ARGON2_0_5_FIXTURE)
+                .unwrap()
+        );
+        assert!(
+            !verifier
+                .verify("wrong-password", ARGON2_0_5_FIXTURE)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_argon2_new_hash_keeps_algorithm_params_and_salt_length() {
+        let hash = PasswordHasher::new(HashAlgorithm::Argon2)
+            .hash("test-password")
+            .unwrap();
+        let parsed = PasswordHash::new(&hash).unwrap();
+        let fixture = PasswordHash::new(ARGON2_0_5_FIXTURE).unwrap();
+
+        assert!(hash.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"));
+        assert_eq!(parsed.algorithm, fixture.algorithm);
+        assert_eq!(parsed.version, fixture.version);
+        assert_eq!(parsed.params, fixture.params);
+        assert_eq!(
+            parsed.salt.unwrap().as_ref().len(),
+            fixture.salt.unwrap().as_ref().len()
+        );
+        assert_eq!(parsed.salt.unwrap().as_ref().len(), 16);
+        assert_eq!(
+            parsed.hash.unwrap().as_ref().len(),
+            fixture.hash.unwrap().as_ref().len()
+        );
+    }
+
+    #[test]
+    fn test_argon2_rejects_tampered_hash() {
+        let tampered = ARGON2_0_5_FIXTURE.replace("m=19456", "m=19457");
+        assert!(
+            !PasswordHasher::default()
+                .verify("correct horse battery staple", &tampered)
+                .unwrap()
+        );
     }
 
     #[test]
