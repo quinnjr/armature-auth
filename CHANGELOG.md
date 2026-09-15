@@ -21,6 +21,10 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 - An unknown username now runs a dummy KDF verification, closing a timing-based user-enumeration oracle.
 - `ApiKeyManager` rate-limit state moved to a `DashMap`; every validation previously serialized on one process-wide mutex held across a sweep.
 
+### Changed — dependencies
+
+- `argon2` `0.5` → `0.6` (default features; `std` no longer exists), `base64` `0.23`, `quick-xml` `0.42`, `reqwest` `0.13`. Argon2 hashing now uses `hash_password`'s built-in 16-byte getrandom salt and `password_hash::phc::PasswordHash`; algorithm and parameters are unchanged (argon2id, v=19, m=19456, t=2, p=1). A test pins a PHC string produced by argon2 0.5, so hashes stored before the upgrade still verify. No public API change.
+
 ### Changed — `0.1.3` → `0.1.4`
 
 - Migrated onto `armature-core` `0.8`'s `Bytes`-backed request and response types. No behavior change beyond what that migration implies; see [`armature-core/CHANGELOG.md`](../armature-core/CHANGELOG.md).
