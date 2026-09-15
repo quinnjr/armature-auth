@@ -9,25 +9,16 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
-### Added
+## [0.4.0] - 2026-09-15
 
-- Adopted the `auth` criterion benchmark (password hashing, API keys, guards, OAuth2, session IDs) from the root package's `benches/`. Run it with `cargo bench -p armature-auth --bench auth`. The crate now sets `autobenches = false`, so a new file under `benches/` needs an explicit `[[bench]]` entry.
+### Changed
 
-### Fixed
-
-- **Breaking:** `SamlConfig::allow_idp_initiated` defaults to `false`, and `validate_response_with_request_id` correlates `InResponseTo` and RelayState. The generated RelayState was previously handed to the caller and never checked, leaving SSO login-CSRF and unsolicited-response replay open.
-- **Breaking:** `MagicLinkToken::verify` is renamed `is_usable`, and the new `verify_token(candidate)` performs the constant-time secret comparison. The old name checked only expiry and the used flag while the module example presented it as the login check.
-- Backup codes use all eight bytes of entropy (64 bits). Half were drawn and discarded, leaving 32 bits on a 2FA bypass credential.
-- An unknown username now runs a dummy KDF verification, closing a timing-based user-enumeration oracle.
-- `ApiKeyManager` rate-limit state moved to a `DashMap`; every validation previously serialized on one process-wide mutex held across a sweep.
+- **Breaking:** requires `armature-core` 0.10 (was `0.9`); its types appear in this crate's API, so the requirement change is breaking here and the minor moves. Part of the `armature-core` 0.10 release train.
+- **Breaking:** requires `armature-jwt` 0.4 (was `0.3`); its types appear in this crate's API, so the requirement change is breaking here and the minor moves. Part of the `armature-core` 0.10 release train.
 
 ### Changed — dependencies
 
 - `argon2` `0.5` → `0.6` (default features; `std` no longer exists), `base64` `0.23`, `quick-xml` `0.42`, `reqwest` `0.13`. Argon2 hashing now uses `hash_password`'s built-in 16-byte getrandom salt and `password_hash::phc::PasswordHash`; algorithm and parameters are unchanged (argon2id, v=19, m=19456, t=2, p=1). A test pins a PHC string produced by argon2 0.5, so hashes stored before the upgrade still verify. No public API change.
-
-### Changed — `0.1.3` → `0.1.4`
-
-- Migrated onto `armature-core` `0.8`'s `Bytes`-backed request and response types. No behavior change beyond what that migration implies; see [`armature-core/CHANGELOG.md`](../armature-core/CHANGELOG.md).
 
 ## [0.3.0] - 2026-08-05
 
