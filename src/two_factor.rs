@@ -1,14 +1,21 @@
 //! Two-Factor Authentication (2FA)
 //!
-//! Provides TOTP (Time-based One-Time Password) and HOTP (HMAC-based One-Time Password)
-//! support for two-factor authentication.
+//! Provides TOTP (Time-based One-Time Password, RFC 6238) support for
+//! two-factor authentication, plus hashed one-time backup codes.
 //!
 //! # Features
 //!
-//! - TOTP generation and validation
+//! - TOTP generation and validation with replay protection
 //! - QR code generation for authenticator apps
-//! - Backup codes generation
-//! - Recovery codes
+//! - Backup codes, stored only as hashes
+//!
+//! # Replay protection
+//!
+//! A TOTP code stays valid for its whole time step (plus the ±1-step skew
+//! window), so a code observed once could otherwise be replayed for ~90 s.
+//! [`TotpSecret::verify`] therefore takes the last time step accepted for this
+//! user and returns the step it matched; persist that and pass it back next
+//! time. [`TotpSecret::verify_and_record`] does both against a `&mut` field.
 //!
 //! # Usage
 //!
@@ -16,33 +23,32 @@
 //! use armature_auth::two_factor::*;
 //!
 //! # async fn example() -> Result<(), TwoFactorError> {
-//! // Generate TOTP secret for user
+//! // Generate TOTP secret for user; persist `secret.to_base32()` encrypted.
 //! let secret = TotpSecret::generate();
-//! println!("Secret: {}", secret.to_base32());
 //!
 //! // Generate QR code URL for authenticator apps
 //! let qr_url = secret.to_qr_url("user@example.com", "MyApp")?;
 //! println!("Scan this QR: {}", qr_url);
 //!
-//! // Verify TOTP code from user
+//! // Verify TOTP code from user, tracking the last accepted step
+//! let mut last_step: Option<u64> = None; // load from the user record
 //! let code = "123456"; // From authenticator app
-//! if secret.verify(code, 30)? {
+//! if secret.verify_and_record(code, 30, &mut last_step)? {
+//!     // save `last_step` back to the user record
 //!     println!("2FA code valid!");
 //! }
 //! # Ok(())
 //! # }
 //! ```
 
-#[cfg(feature = "two-factor")]
 use data_encoding::BASE32_NOPAD;
-#[cfg(feature = "two-factor")]
 use qrcode::{QrCode, render::svg};
-#[cfg(feature = "two-factor")]
-use totp_lite::{Sha1, totp_custom};
-
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fmt;
 use thiserror::Error;
+use totp_lite::{Sha1, totp_custom};
 
 /// Constant-time string comparison (prevents timing attacks on secret-derived
 /// values such as TOTP codes and backup codes).
@@ -63,6 +69,9 @@ pub enum TwoFactorError {
     #[error("Invalid secret")]
     InvalidSecret,
 
+    #[error("Invalid TOTP time step: must be greater than zero")]
+    InvalidTimeStep,
+
     #[error("QR code generation failed: {0}")]
     QrCodeError(String),
 
@@ -70,15 +79,34 @@ pub enum TwoFactorError {
     FeatureNotEnabled(&'static str),
 }
 
-/// TOTP Secret
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// TOTP Secret.
+///
+/// Redacted from `Debug` and deliberately not `Serialize`/`Deserialize`:
+/// persist it explicitly via [`to_base32`](Self::to_base32) (preferably
+/// encrypted at rest) and restore it with [`from_base32`](Self::from_base32).
+#[derive(Clone)]
 pub struct TotpSecret {
     /// Base32-encoded secret
     secret: String,
 }
 
+impl fmt::Debug for TotpSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TotpSecret")
+            .field("secret", &"<redacted>")
+            .finish()
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 impl TotpSecret {
-    /// Generate a new random TOTP secret
+    /// Generate a new random 160-bit TOTP secret
     ///
     /// # Examples
     ///
@@ -86,31 +114,43 @@ impl TotpSecret {
     /// use armature_auth::two_factor::*;
     ///
     /// let secret = TotpSecret::generate();
-    /// println!("Secret: {}", secret.to_base32());
+    /// assert_eq!(secret.to_base32().len(), 32);
     /// ```
     pub fn generate() -> Self {
         let mut rng = rand::rng();
         let bytes: Vec<u8> = (0..20).map(|_| rng.random()).collect();
-
-        #[cfg(feature = "two-factor")]
-        let secret = BASE32_NOPAD.encode(&bytes);
-
-        #[cfg(not(feature = "two-factor"))]
-        let secret = base64::encode(&bytes);
-
-        Self { secret }
+        Self {
+            secret: BASE32_NOPAD.encode(&bytes),
+        }
     }
 
-    /// Create TOTP secret from base32 string
-    pub fn from_base32(secret: impl Into<String>) -> Self {
-        Self {
-            secret: secret.into(),
+    /// Restore a TOTP secret from its base32 form.
+    ///
+    /// # Errors
+    ///
+    /// [`TwoFactorError::InvalidSecret`] if `secret` is not valid unpadded
+    /// base32 or decodes to fewer than 16 bytes (128 bits, RFC 4226's
+    /// minimum).
+    pub fn from_base32(secret: impl Into<String>) -> Result<Self, TwoFactorError> {
+        let secret = secret.into();
+        let bytes = BASE32_NOPAD
+            .decode(secret.as_bytes())
+            .map_err(|_| TwoFactorError::InvalidSecret)?;
+        if bytes.len() < 16 {
+            return Err(TwoFactorError::InvalidSecret);
         }
+        Ok(Self { secret })
     }
 
     /// Get base32-encoded secret
     pub fn to_base32(&self) -> &str {
         &self.secret
+    }
+
+    fn secret_bytes(&self) -> Result<Vec<u8>, TwoFactorError> {
+        BASE32_NOPAD
+            .decode(self.secret.as_bytes())
+            .map_err(|_| TwoFactorError::InvalidSecret)
     }
 
     /// Generate TOTP code for current time
@@ -121,78 +161,108 @@ impl TotpSecret {
     /// use armature_auth::two_factor::*;
     ///
     /// let secret = TotpSecret::generate();
-    /// # #[cfg(feature = "two-factor")]
     /// let code = secret.generate_code(30).unwrap();
-    /// # #[cfg(feature = "two-factor")]
-    /// println!("Current TOTP: {}", code);
+    /// assert_eq!(code.len(), 6);
+    /// assert!(secret.generate_code(0).is_err());
     /// ```
-    #[cfg(feature = "two-factor")]
     pub fn generate_code(&self, time_step: u64) -> Result<String, TwoFactorError> {
-        let secret_bytes = BASE32_NOPAD
-            .decode(self.secret.as_bytes())
-            .map_err(|_| TwoFactorError::InvalidSecret)?;
-
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
+        if time_step == 0 {
+            return Err(TwoFactorError::InvalidTimeStep);
+        }
+        let secret_bytes = self.secret_bytes()?;
         // totp-lite returns the code already zero-padded to the requested digit count.
-        let code = totp_custom::<Sha1>(time_step, 6, &secret_bytes, timestamp);
-        Ok(code)
+        Ok(totp_custom::<Sha1>(time_step, 6, &secret_bytes, unix_now()))
     }
 
-    #[cfg(not(feature = "two-factor"))]
-    pub fn generate_code(&self, _time_step: u64) -> Result<String, TwoFactorError> {
-        Err(TwoFactorError::FeatureNotEnabled("two-factor"))
-    }
-
-    /// Verify TOTP code
+    /// Verify a TOTP code, rejecting replays.
     ///
-    /// Checks code against current time ± window (default: 1 time step = 30s before/after).
+    /// Checks the code against the current time step and one step either
+    /// side (clock skew). A step at or before `last_accepted_step` is never
+    /// accepted, so a code (or an older one) cannot be used twice.
+    ///
+    /// Returns `Ok(Some(step))` with the matched time step on success —
+    /// **persist it** and pass it as `last_accepted_step` on the next call —
+    /// or `Ok(None)` if the code is wrong or replayed.
+    ///
+    /// # Errors
+    ///
+    /// [`TwoFactorError::InvalidTimeStep`] for `time_step == 0`,
+    /// [`TwoFactorError::InvalidSecret`] for an undecodable secret.
     ///
     /// # Examples
     ///
     /// ```
     /// use armature_auth::two_factor::*;
     ///
-    /// # #[cfg(feature = "two-factor")]
     /// # fn example() -> Result<(), TwoFactorError> {
     /// let secret = TotpSecret::generate();
     /// let code = secret.generate_code(30)?;
     ///
-    /// // Verify the code
-    /// assert!(secret.verify(&code, 30)?);
+    /// let step = secret.verify(&code, 30, None)?.expect("valid");
+    /// // The same code again is a replay.
+    /// assert_eq!(secret.verify(&code, 30, Some(step))?, None);
     /// # Ok(())
     /// # }
+    /// # example().unwrap();
     /// ```
-    #[cfg(feature = "two-factor")]
-    pub fn verify(&self, code: &str, time_step: u64) -> Result<bool, TwoFactorError> {
-        let secret_bytes = BASE32_NOPAD
-            .decode(self.secret.as_bytes())
-            .map_err(|_| TwoFactorError::InvalidSecret)?;
-
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        // Check current time and ±1 time window
-        for offset in [-1, 0, 1] {
-            let check_time = ((timestamp as i64) + (offset * time_step as i64)) as u64;
-            let expected_code = totp_custom::<Sha1>(time_step, 6, &secret_bytes, check_time);
-
-            if constant_time_eq(&expected_code, code) {
-                return Ok(true);
-            }
-        }
-
-        Ok(false)
+    pub fn verify(
+        &self,
+        code: &str,
+        time_step: u64,
+        last_accepted_step: Option<u64>,
+    ) -> Result<Option<u64>, TwoFactorError> {
+        self.verify_at(code, time_step, last_accepted_step, unix_now())
     }
 
-    #[cfg(not(feature = "two-factor"))]
-    pub fn verify(&self, _code: &str, _time_step: u64) -> Result<bool, TwoFactorError> {
-        Err(TwoFactorError::FeatureNotEnabled("two-factor"))
+    fn verify_at(
+        &self,
+        code: &str,
+        time_step: u64,
+        last_accepted_step: Option<u64>,
+        now: u64,
+    ) -> Result<Option<u64>, TwoFactorError> {
+        if time_step == 0 {
+            return Err(TwoFactorError::InvalidTimeStep);
+        }
+        let secret_bytes = self.secret_bytes()?;
+        let current = now / time_step;
+
+        // Scan every candidate step without early exit so timing does not
+        // reveal which window matched.
+        let mut matched: Option<u64> = None;
+        for step in [
+            current.checked_sub(1),
+            Some(current),
+            current.checked_add(1),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let expected = totp_custom::<Sha1>(time_step, 6, &secret_bytes, step * time_step);
+            let fresh = last_accepted_step.is_none_or(|last| step > last);
+            if constant_time_eq(&expected, code) && fresh && matched.is_none() {
+                matched = Some(step);
+            }
+        }
+        Ok(matched)
+    }
+
+    /// [`verify`](Self::verify) and update `last_accepted_step` in place on
+    /// success. Returns whether the code was accepted. Persist
+    /// `last_accepted_step` afterwards.
+    pub fn verify_and_record(
+        &self,
+        code: &str,
+        time_step: u64,
+        last_accepted_step: &mut Option<u64>,
+    ) -> Result<bool, TwoFactorError> {
+        match self.verify(code, time_step, *last_accepted_step)? {
+            Some(step) => {
+                *last_accepted_step = Some(step);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     /// Generate QR code URL for authenticator apps
@@ -205,7 +275,7 @@ impl TotpSecret {
     /// # fn example() -> Result<(), TwoFactorError> {
     /// let secret = TotpSecret::generate();
     /// let url = secret.to_qr_url("user@example.com", "MyApp")?;
-    /// println!("otpauth:// URL: {}", url);
+    /// assert!(url.starts_with("otpauth://totp/"));
     /// # Ok(())
     /// # }
     /// ```
@@ -223,7 +293,6 @@ impl TotpSecret {
     /// Generate QR code SVG
     ///
     /// Returns SVG string that can be rendered in HTML.
-    #[cfg(feature = "two-factor")]
     pub fn to_qr_svg(&self, account: &str, issuer: &str) -> Result<String, TwoFactorError> {
         let url = self.to_qr_url(account, issuer)?;
 
@@ -234,49 +303,86 @@ impl TotpSecret {
 
         Ok(svg)
     }
+}
 
-    #[cfg(not(feature = "two-factor"))]
-    pub fn to_qr_svg(&self, _account: &str, _issuer: &str) -> Result<String, TwoFactorError> {
-        Err(TwoFactorError::FeatureNotEnabled("two-factor"))
+/// Backup/recovery codes, stored as hashes.
+///
+/// [`BackupCodes::generate`] returns the plaintext codes once, in
+/// [`GeneratedBackupCodes`], for display to the user; this type keeps only
+/// their SHA-256 hashes and is what you persist. Each code carries 80 bits of
+/// entropy, so an unkeyed hash is not brute-forceable.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct BackupCodes {
+    /// Hex SHA-256 of each unused code (normalized: hyphens removed,
+    /// lower-cased).
+    pub code_hashes: Vec<String>,
+}
+
+impl fmt::Debug for BackupCodes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BackupCodes")
+            .field("remaining", &self.code_hashes.len())
+            .finish()
     }
 }
 
-/// Backup/Recovery codes
+/// Freshly generated backup codes: the hashed [`BackupCodes`] to store plus
+/// the plaintext codes to show the user exactly once.
 ///
-/// Generate one-time use backup codes for account recovery.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BackupCodes {
-    /// List of backup codes
-    pub codes: Vec<String>,
+/// Redacted from `Debug`; not `Serialize`.
+#[derive(Clone)]
+pub struct GeneratedBackupCodes {
+    /// The hashed codes to persist.
+    pub stored: BackupCodes,
+    plaintext: Vec<String>,
+}
+
+impl GeneratedBackupCodes {
+    /// The plaintext codes, for one-time display.
+    pub fn plaintext(&self) -> &[String] {
+        &self.plaintext
+    }
+}
+
+impl fmt::Debug for GeneratedBackupCodes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GeneratedBackupCodes")
+            .field("stored", &self.stored)
+            .field("plaintext", &"<redacted>")
+            .finish()
+    }
 }
 
 impl BackupCodes {
     /// Number of random bytes behind each backup code. Backup codes are 2FA
     /// bypass credentials: presenting one substitutes for the second factor
-    /// entirely, so the code must be as hard to guess as the factor it replaces.
-    /// Eight bytes are drawn and all eight are rendered — an earlier version
-    /// dropped half of them, leaving 32 bits, which is within reach of an online
-    /// guessing campaign against a known account.
-    const CODE_BYTES: usize = 8;
+    /// entirely, so the code must be as hard to guess as the factor it
+    /// replaces — and, since only an unkeyed hash is stored, hard to brute
+    /// force offline from a leaked hash. 10 bytes = 80 bits.
+    const CODE_BYTES: usize = 10;
 
     /// Generate backup codes
     ///
-    /// Each code carries `CODE_BYTES` bytes (64 bits) of entropy, rendered as
-    /// four hyphen-separated groups of four hex digits for transcription.
+    /// Each code carries `CODE_BYTES` bytes (80 bits) of entropy, rendered as
+    /// five hyphen-separated groups of four hex digits for transcription.
     ///
     /// # Examples
     ///
     /// ```
     /// use armature_auth::two_factor::*;
     ///
-    /// let codes = BackupCodes::generate(10);
-    /// for code in &codes.codes {
-    ///     println!("Backup code: {}", code);
+    /// let generated = BackupCodes::generate(10);
+    /// for code in generated.plaintext() {
+    ///     println!("Backup code: {}", code); // show once
     /// }
+    /// let mut stored = generated.stored.clone(); // persist this
+    /// let first = generated.plaintext()[0].clone();
+    /// assert!(stored.verify_and_consume(&first));
+    /// assert!(!stored.verify_and_consume(&first));
     /// ```
-    pub fn generate(count: usize) -> Self {
+    pub fn generate(count: usize) -> GeneratedBackupCodes {
         let mut rng = rand::rng();
-        let codes = (0..count)
+        let plaintext: Vec<String> = (0..count)
             .map(|_| {
                 let bytes: Vec<u8> = (0..Self::CODE_BYTES).map(|_| rng.random()).collect();
                 let hex = hex::encode(bytes);
@@ -288,27 +394,43 @@ impl BackupCodes {
             })
             .collect();
 
-        Self { codes }
+        GeneratedBackupCodes {
+            stored: Self {
+                code_hashes: plaintext.iter().map(|c| Self::hash_code(c)).collect(),
+            },
+            plaintext,
+        }
+    }
+
+    /// The stored form of a code: hex SHA-256 of the code with hyphens and
+    /// whitespace removed, lower-cased.
+    pub fn hash_code(code: &str) -> String {
+        let normalized: String = code
+            .chars()
+            .filter(|c| *c != '-' && !c.is_whitespace())
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        hex::encode(Sha256::digest(normalized.as_bytes()))
     }
 
     /// Verify and consume a backup code
     ///
-    /// Returns true if code was valid and removes it from the list.
+    /// Returns true if code was valid and removes it from the list; persist
+    /// the updated value before completing the login.
     ///
-    /// Every stored code is compared against the candidate in constant time
-    /// and the scan always runs to completion (no early exit on match), so
-    /// neither which byte differs nor which position matches is observable
-    /// via timing.
+    /// Every stored hash is compared against the candidate's in constant time
+    /// and the scan always runs to completion (no early exit on match).
     pub fn verify_and_consume(&mut self, code: &str) -> bool {
+        let candidate = Self::hash_code(code);
         let mut found: Option<usize> = None;
-        for (i, c) in self.codes.iter().enumerate() {
-            if constant_time_eq(c, code) {
+        for (i, c) in self.code_hashes.iter().enumerate() {
+            if constant_time_eq(c, &candidate) {
                 found = found.or(Some(i));
             }
         }
 
         if let Some(pos) = found {
-            self.codes.remove(pos);
+            self.code_hashes.remove(pos);
             true
         } else {
             false
@@ -317,7 +439,7 @@ impl BackupCodes {
 
     /// Check remaining codes
     pub fn remaining(&self) -> usize {
-        self.codes.len()
+        self.code_hashes.len()
     }
 }
 
@@ -329,21 +451,79 @@ mod tests {
     fn test_generate_totp_secret() {
         let secret = TotpSecret::generate();
         assert!(!secret.to_base32().is_empty());
+        assert!(TotpSecret::from_base32(secret.to_base32()).is_ok());
     }
 
     #[test]
-    #[cfg(feature = "two-factor")]
+    fn from_base32_rejects_invalid_and_short_secrets() {
+        assert!(TotpSecret::from_base32("not base32!").is_err());
+        assert!(TotpSecret::from_base32("JBSWY3DP").is_err()); // 5 bytes
+    }
+
+    #[test]
     fn test_generate_and_verify_totp() {
         let secret = TotpSecret::generate();
         let code = secret.generate_code(30).unwrap();
-        assert!(secret.verify(&code, 30).unwrap());
+        assert!(secret.verify(&code, 30, None).unwrap().is_some());
     }
 
     #[test]
-    #[cfg(feature = "two-factor")]
+    fn zero_time_step_is_rejected_not_a_panic() {
+        let secret = TotpSecret::generate();
+        assert!(matches!(
+            secret.generate_code(0),
+            Err(TwoFactorError::InvalidTimeStep)
+        ));
+        assert!(matches!(
+            secret.verify("123456", 0, None),
+            Err(TwoFactorError::InvalidTimeStep)
+        ));
+    }
+
+    #[test]
+    fn verified_code_cannot_be_replayed() {
+        let secret = TotpSecret::generate();
+        let code = secret.generate_code(30).unwrap();
+
+        let mut last = None;
+        assert!(secret.verify_and_record(&code, 30, &mut last).unwrap());
+        assert!(last.is_some());
+        assert!(!secret.verify_and_record(&code, 30, &mut last).unwrap());
+    }
+
+    #[test]
+    fn older_steps_rejected_after_newer_accepted() {
+        let secret = TotpSecret::generate();
+        let bytes = secret.secret_bytes().unwrap();
+        let now = 1_000_000_000u64; // fixed clock
+        let current = now / 30;
+        let previous_code = totp_custom::<Sha1>(30, 6, &bytes, (current - 1) * 30);
+        let current_code = totp_custom::<Sha1>(30, 6, &bytes, current * 30);
+
+        // The previous-step code is within the skew window...
+        assert_eq!(
+            secret.verify_at(&previous_code, 30, None, now).unwrap(),
+            Some(current - 1)
+        );
+        // ...but not once the current step has been accepted.
+        let step = secret
+            .verify_at(&current_code, 30, None, now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(step, current);
+        assert_eq!(
+            secret
+                .verify_at(&previous_code, 30, Some(step), now)
+                .unwrap(),
+            None
+        );
+        // Codes outside the window are rejected.
+        let stale = totp_custom::<Sha1>(30, 6, &bytes, (current - 2) * 30);
+        assert_eq!(secret.verify_at(&stale, 30, None, now).unwrap(), None);
+    }
+
+    #[test]
     fn test_verify_totp_rejects_wrong_code() {
-        // Functional-correctness check for the constant-time comparison in
-        // `TotpSecret::verify`: an incorrect code must still be rejected.
         let secret = TotpSecret::generate();
         let code = secret.generate_code(30).unwrap();
 
@@ -353,9 +533,42 @@ mod tests {
         let flipped = if last == '0' { '1' } else { '0' };
         wrong.push(flipped);
 
-        assert!(!secret.verify(&wrong, 30).unwrap());
+        assert!(secret.verify(&wrong, 30, None).unwrap().is_none());
         // Different-length input must also be rejected without panicking.
-        assert!(!secret.verify(&format!("{}9", code), 30).unwrap());
+        assert!(
+            secret
+                .verify(&format!("{}9", code), 30, None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn secrets_are_redacted_from_debug() {
+        let secret = TotpSecret::generate();
+        let debug = format!("{secret:?}");
+        assert!(!debug.contains(secret.to_base32()), "{debug}");
+        assert!(debug.contains("<redacted>"));
+
+        let generated = BackupCodes::generate(3);
+        let debug = format!("{generated:?}");
+        for code in generated.plaintext() {
+            assert!(!debug.contains(code.as_str()), "{debug}");
+        }
+        for hash in &generated.stored.code_hashes {
+            assert!(!debug.contains(hash.as_str()), "{debug}");
+        }
+    }
+
+    #[test]
+    fn stored_backup_codes_contain_no_plaintext() {
+        let generated = BackupCodes::generate(5);
+        let json = serde_json::to_string(&generated.stored).unwrap();
+        for code in generated.plaintext() {
+            assert!(!json.contains(code.as_str()), "{json}");
+            let bare: String = code.chars().filter(|c| *c != '-').collect();
+            assert!(!json.contains(&bare), "{json}");
+        }
     }
 
     #[test]
@@ -373,30 +586,17 @@ mod tests {
         let url = secret.to_qr_url("user@example.com", "MyApp").unwrap();
         assert!(url.starts_with("otpauth://totp/"));
         // The account name is percent-encoded (per RFC 3986) before being
-        // embedded in the URL, so "@" becomes "%40" rather than appearing
-        // literally — this is correct, safe encoding, not a bug.
+        // embedded in the URL, so "@" becomes "%40".
         assert!(url.contains("user%40example.com"));
         assert!(url.contains("MyApp"));
     }
 
     #[test]
-    fn test_backup_codes() {
-        let codes = BackupCodes::generate(10);
-        assert_eq!(codes.codes.len(), 10);
-
-        for code in &codes.codes {
-            assert!(code.contains('-'));
-        }
-    }
-
-    #[test]
     fn test_backup_codes_use_full_entropy() {
-        // A backup code bypasses the second factor, so its guessability is the
-        // security of 2FA for that account. The generator previously rendered
-        // only 4 of the 16 hex digits it drew, leaving 32 bits.
-        let codes = BackupCodes::generate(64);
+        let generated = BackupCodes::generate(64);
+        assert_eq!(generated.plaintext().len(), 64);
 
-        for code in &codes.codes {
+        for code in generated.plaintext() {
             let hex: String = code.chars().filter(|c| *c != '-').collect();
             assert_eq!(
                 hex.len(),
@@ -406,16 +606,15 @@ mod tests {
             assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
         }
 
-        // With 64 bits per code, 64 codes colliding is not something that
-        // happens by chance — it happens when entropy is being discarded.
-        let unique: std::collections::HashSet<&String> = codes.codes.iter().collect();
-        assert_eq!(unique.len(), codes.codes.len());
+        let unique: std::collections::HashSet<&String> = generated.plaintext().iter().collect();
+        assert_eq!(unique.len(), 64);
     }
 
     #[test]
     fn test_backup_code_consumption() {
-        let mut codes = BackupCodes::generate(5);
-        let first_code = codes.codes[0].clone();
+        let generated = BackupCodes::generate(5);
+        let mut codes = generated.stored.clone();
+        let first_code = generated.plaintext()[0].clone();
 
         assert_eq!(codes.remaining(), 5);
         assert!(codes.verify_and_consume(&first_code));
@@ -424,25 +623,32 @@ mod tests {
     }
 
     #[test]
+    fn backup_code_accepts_transcription_variants() {
+        let generated = BackupCodes::generate(1);
+        let mut codes = generated.stored.clone();
+        let variant: String = generated.plaintext()[0]
+            .chars()
+            .filter(|c| *c != '-')
+            .map(|c| c.to_ascii_uppercase())
+            .collect();
+        assert!(codes.verify_and_consume(&variant));
+    }
+
+    #[test]
     fn test_backup_code_rejects_unknown_code() {
-        // Functional-correctness check for the constant-time scan in
-        // `BackupCodes::verify_and_consume`: a code that was never issued
-        // must be rejected and the list left untouched.
-        let mut codes = BackupCodes::generate(5);
+        let mut codes = BackupCodes::generate(5).stored;
         assert!(!codes.verify_and_consume("0000-0000"));
         assert_eq!(codes.remaining(), 5);
     }
 
     #[test]
     fn test_backup_code_consumes_any_matching_position() {
-        // The scan no longer short-circuits on the first match; make sure a
-        // code in the middle/end of the list is still found and consumed
-        // correctly, and that only that one code is removed.
-        let mut codes = BackupCodes::generate(5);
-        let last_code = codes.codes[4].clone();
+        let generated = BackupCodes::generate(5);
+        let mut codes = generated.stored.clone();
+        let last_code = generated.plaintext()[4].clone();
 
         assert!(codes.verify_and_consume(&last_code));
         assert_eq!(codes.remaining(), 4);
-        assert!(!codes.codes.contains(&last_code));
+        assert!(!codes.verify_and_consume(&last_code));
     }
 }

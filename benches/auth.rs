@@ -53,7 +53,8 @@ fn password_hashing_benchmark(c: &mut Criterion) {
 
 fn jwt_benchmark(c: &mut Criterion) {
     let jwt_config =
-        JwtConfig::new("super_secret_key_for_benchmarking_purposes_only_12345".to_string());
+        JwtConfig::new("super_secret_key_for_benchmarking_purposes_only_12345".to_string())
+            .unwrap();
     let jwt_manager = JwtManager::new(jwt_config).unwrap();
 
     let mut group = c.benchmark_group("jwt_operations");

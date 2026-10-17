@@ -3,10 +3,13 @@
 use crate::{AuthError, Result};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 // Using samael for SAML support
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
+use std::sync::Arc;
 
 /// SAML authentication provider trait
 #[async_trait]
@@ -17,12 +20,116 @@ pub trait SamlProvider: Send + Sync {
     /// Generate SAML authentication request
     fn create_auth_request(&self) -> Result<SamlAuthRequest>;
 
-    /// Parse and validate SAML response
-    async fn validate_response(&self, saml_response: &str) -> Result<SamlAssertion>;
+    /// Parse and validate a SAML response **for the login this SP started**.
+    ///
+    /// `expected_request_id` is the [`SamlAuthRequest::request_id`] stored
+    /// when the flow began; the response's `InResponseTo` must match it.
+    /// When RelayState is used, `expected_relay_state` is the issued value and
+    /// `received_relay_state` the one the IdP sent back.
+    ///
+    /// Each accepted assertion ID is recorded in the provider's
+    /// [`AssertionReplayCache`] and a second presentation is rejected.
+    async fn validate_response(
+        &self,
+        saml_response: &str,
+        expected_request_id: &str,
+        expected_relay_state: Option<&str>,
+        received_relay_state: Option<&str>,
+    ) -> Result<SamlAssertion>;
 
     /// Get SP metadata XML
     fn get_metadata(&self) -> Result<String>;
 }
+
+/// Record of consumed assertion IDs, used to reject replayed SAML assertions.
+///
+/// An assertion ID is remembered until the assertion itself expires, after
+/// which signature/condition validation rejects it anyway. The default
+/// [`InMemoryReplayCache`] is **per process**: a deployment with several
+/// instances behind a load balancer must back this with shared storage (e.g.
+/// Redis `SET key 1 NX PXAT <expiry>`), or a captured assertion can be
+/// replayed against a different instance.
+#[async_trait]
+pub trait AssertionReplayCache: Send + Sync {
+    /// Atomically record `assertion_id` as consumed until `expires_at`.
+    ///
+    /// Returns `Ok(true)` if it was not already recorded (first use) and
+    /// `Ok(false)` if it was (replay).
+    async fn check_and_insert(&self, assertion_id: &str, expires_at: DateTime<Utc>)
+    -> Result<bool>;
+}
+
+/// In-process [`AssertionReplayCache`] (see the trait docs for its
+/// multi-instance limitation). Expired entries are pruned as new ones arrive.
+#[derive(Default)]
+pub struct InMemoryReplayCache {
+    seen: DashMap<String, DateTime<Utc>>,
+}
+
+impl InMemoryReplayCache {
+    /// Prune once the map holds this many entries.
+    const PRUNE_THRESHOLD: usize = 1024;
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Number of remembered assertion IDs.
+    pub fn len(&self) -> usize {
+        self.seen.len()
+    }
+
+    /// Whether no assertion IDs are remembered.
+    pub fn is_empty(&self) -> bool {
+        self.seen.is_empty()
+    }
+
+    /// Drop entries whose assertion has expired.
+    pub fn prune_expired(&self) {
+        let now = Utc::now();
+        self.seen.retain(|_, expires_at| *expires_at > now);
+    }
+}
+
+#[async_trait]
+impl AssertionReplayCache for InMemoryReplayCache {
+    async fn check_and_insert(
+        &self,
+        assertion_id: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        use dashmap::mapref::entry::Entry;
+
+        let now = Utc::now();
+        if self.seen.len() >= Self::PRUNE_THRESHOLD {
+            self.prune_expired();
+        }
+        let first_use = match self.seen.entry(assertion_id.to_string()) {
+            Entry::Occupied(mut entry) => {
+                if *entry.get() > now {
+                    false
+                } else {
+                    // A stale entry for an expired assertion: reuse the slot.
+                    entry.insert(expires_at);
+                    true
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(expires_at);
+                true
+            }
+        };
+        Ok(first_use)
+    }
+}
+
+/// How long a consumed assertion ID is remembered beyond its
+/// `NotOnOrAfter`, covering clock skew tolerated by validation.
+const REPLAY_SKEW: chrono::Duration = chrono::Duration::minutes(5);
+
+/// Upper bound on how long an assertion ID is remembered (and the fallback
+/// when the assertion carries no `NotOnOrAfter`).
+const REPLAY_MAX_TTL: chrono::Duration = chrono::Duration::hours(24);
 
 /// SAML authentication request
 #[derive(Debug, Clone)]
@@ -47,6 +154,9 @@ pub struct SamlAuthRequest {
 /// SAML assertion (user information from IdP)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SamlAssertion {
+    /// The assertion's `ID` (recorded in the replay cache)
+    pub assertion_id: String,
+
     /// Name ID (user identifier)
     pub name_id: String,
 
@@ -68,7 +178,9 @@ pub struct SamlAssertion {
 }
 
 /// SAML Service Provider configuration
-#[derive(Debug, Clone)]
+///
+/// `sp_private_key` is redacted from `Debug` output.
+#[derive(Clone)]
 pub struct SamlConfig {
     /// Entity ID (SP identifier)
     pub entity_id: String,
@@ -97,16 +209,37 @@ pub struct SamlConfig {
     /// Accept responses that do not correspond to an AuthnRequest this SP
     /// issued (IdP-initiated SSO).
     ///
-    /// Defaults to `false`. When `false`, a response must be validated through
-    /// [`SamlServiceProvider::validate_response_with_request_id`] with the ID
-    /// of the AuthnRequest that started the flow, and its `InResponseTo` must
-    /// match. Turn it on only if the deployment genuinely uses IdP-initiated
-    /// SSO — it is what makes unsolicited responses acceptable, and with it on
-    /// there is nothing tying a response to the browser session receiving it.
+    /// Defaults to `false`. Responses are validated through
+    /// [`SamlProvider::validate_response`] with the ID of the AuthnRequest
+    /// that started the flow, and their `InResponseTo` must match. Turning
+    /// this on additionally enables
+    /// [`SamlServiceProvider::validate_unsolicited_response`]; do so only if
+    /// the deployment genuinely uses IdP-initiated SSO — nothing ties an
+    /// unsolicited response to the browser session receiving it.
     pub allow_idp_initiated: bool,
 
     /// Required assertion attributes
     pub required_attributes: Vec<String>,
+}
+
+impl fmt::Debug for SamlConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SamlConfig")
+            .field("entity_id", &self.entity_id)
+            .field("acs_url", &self.acs_url)
+            .field("sls_url", &self.sls_url)
+            .field("idp_metadata", &self.idp_metadata)
+            .field("sp_certificate", &self.sp_certificate)
+            .field(
+                "sp_private_key",
+                &self.sp_private_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("contact_person", &self.contact_person)
+            .field("allow_unsigned_assertions", &self.allow_unsigned_assertions)
+            .field("allow_idp_initiated", &self.allow_idp_initiated)
+            .field("required_attributes", &self.required_attributes)
+            .finish()
+    }
 }
 
 /// IdP metadata source
@@ -195,6 +328,8 @@ pub struct SamlServiceProvider {
     /// the validate path's `allow_unsigned_assertions` branch clears `key_descriptors`
     /// on its own fresh clone so the shared cached copy stays intact.
     idp_entity: Option<samael::metadata::EntityDescriptor>,
+    /// Consumed assertion IDs (replay protection).
+    replay_cache: Arc<dyn AssertionReplayCache>,
 }
 
 impl SamlServiceProvider {
@@ -232,52 +367,58 @@ impl SamlServiceProvider {
             name,
             config,
             idp_entity,
+            replay_cache: Arc::new(InMemoryReplayCache::new()),
         })
     }
 
-    /// Validate a SAML response against the login flow this SP started.
+    /// Use `cache` to record consumed assertion IDs instead of the default
+    /// per-process [`InMemoryReplayCache`]. Multi-instance deployments must
+    /// supply a shared cache.
+    pub fn with_replay_cache(mut self, cache: Arc<dyn AssertionReplayCache>) -> Self {
+        self.replay_cache = cache;
+        self
+    }
+
+    /// Validate an **unsolicited** (IdP-initiated) SAML response.
     ///
-    /// This is the correlated counterpart to
-    /// [`SamlProvider::validate_response`]: it requires the response's
-    /// `InResponseTo` to match `expected_request_id` (the
-    /// [`SamlAuthRequest::request_id`] stored when the flow began), and
-    /// optionally that the returned RelayState matches the one issued.
-    ///
-    /// Signature, issuer, audience and expiry are enforced either way — what
-    /// this adds is the binding between the response and *this browser's*
-    /// login attempt. Without it, an attacker can complete SSO in a victim's
-    /// browser using an assertion for the attacker's own account (login CSRF),
-    /// or replay a captured unsolicited response.
-    ///
-    /// # Arguments
-    ///
-    /// * `expected_request_id` - the AuthnRequest ID this SP issued
-    /// * `expected_relay_state` - the RelayState issued with that request, if
-    ///   RelayState is being used; `None` skips the check
-    /// * `received_relay_state` - the RelayState the IdP sent back
-    pub fn validate_response_with_request_id(
+    /// Refused unless [`SamlConfig::allow_idp_initiated`] is set. There is no
+    /// `InResponseTo` to correlate, so nothing binds the response to the
+    /// browser presenting it; prefer SP-initiated flows and
+    /// [`SamlProvider::validate_response`]. Replay protection still applies.
+    pub async fn validate_unsolicited_response(
         &self,
         saml_response: &str,
-        expected_request_id: &str,
-        expected_relay_state: Option<&str>,
-        received_relay_state: Option<&str>,
     ) -> Result<SamlAssertion> {
-        if let Some(expected) = expected_relay_state {
-            let received = received_relay_state.ok_or_else(|| {
-                AuthError::SamlValidation(
-                    "SAML response is missing the RelayState issued with the AuthnRequest"
-                        .to_string(),
-                )
-            })?;
-            if !armature_core::crypto::constant_time_eq(expected.as_bytes(), received.as_bytes()) {
-                return Err(AuthError::SamlValidation(
-                    "SAML RelayState does not match the value issued with the AuthnRequest"
-                        .to_string(),
-                ));
-            }
+        if !self.config.allow_idp_initiated {
+            return Err(AuthError::SamlValidation(
+                "unsolicited (IdP-initiated) SAML responses are disabled; enable \
+                 SamlConfig::allow_idp_initiated to accept them"
+                    .to_string(),
+            ));
         }
+        let assertion = self.validate_response_verified(saml_response, None)?;
+        self.record_assertion(assertion).await
+    }
 
-        self.validate_response_verified(saml_response, Some(expected_request_id))
+    /// Record the assertion in the replay cache, rejecting a second use.
+    async fn record_assertion(
+        &self,
+        (assertion, expires_at): (SamlAssertion, DateTime<Utc>),
+    ) -> Result<SamlAssertion> {
+        let now = Utc::now();
+        let remember_until = (expires_at + REPLAY_SKEW).min(now + REPLAY_MAX_TTL);
+        if self
+            .replay_cache
+            .check_and_insert(&assertion.assertion_id, remember_until)
+            .await?
+        {
+            Ok(assertion)
+        } else {
+            Err(AuthError::SamlValidation(format!(
+                "SAML assertion {} has already been used (replay)",
+                assertion.assertion_id
+            )))
+        }
     }
 
     /// Generate relay state
@@ -313,24 +454,31 @@ impl SamlProvider for SamlServiceProvider {
         }
     }
 
-    async fn validate_response(&self, saml_response: &str) -> Result<SamlAssertion> {
-        #[cfg(feature = "saml")]
-        {
-            self.validate_response_verified(saml_response, None)
+    async fn validate_response(
+        &self,
+        saml_response: &str,
+        expected_request_id: &str,
+        expected_relay_state: Option<&str>,
+        received_relay_state: Option<&str>,
+    ) -> Result<SamlAssertion> {
+        if let Some(expected) = expected_relay_state {
+            let received = received_relay_state.ok_or_else(|| {
+                AuthError::SamlValidation(
+                    "SAML response is missing the RelayState issued with the AuthnRequest"
+                        .to_string(),
+                )
+            })?;
+            if !armature_core::crypto::constant_time_eq(expected.as_bytes(), received.as_bytes()) {
+                return Err(AuthError::SamlValidation(
+                    "SAML RelayState does not match the value issued with the AuthnRequest"
+                        .to_string(),
+                ));
+            }
         }
 
-        // Without the `saml` feature there is no XML-signature verification available.
-        // A SAML validator that cannot verify signatures is worse than an explicit
-        // unsupported error, so refuse rather than accept an unverified assertion.
-        #[cfg(not(feature = "saml"))]
-        {
-            let _ = saml_response;
-            Err(AuthError::SamlValidation(
-                "SAML response validation requires the `saml` feature (XML signature \
-                 verification); refusing to validate without it"
-                    .to_string(),
-            ))
-        }
+        let assertion =
+            self.validate_response_verified(saml_response, Some(expected_request_id))?;
+        self.record_assertion(assertion).await
     }
 
     fn get_metadata(&self) -> Result<String> {
@@ -533,11 +681,14 @@ fn pem_body(pem: &str) -> String {
 /// without a verified signature unless `allow_unsigned_assertions` is explicitly set.
 #[cfg(feature = "saml")]
 impl SamlServiceProvider {
+    /// Returns the assertion and the instant it stops being valid (the
+    /// earliest `NotOnOrAfter` across Conditions and SubjectConfirmationData,
+    /// or now + [`REPLAY_MAX_TTL`] if none is present).
     fn validate_response_verified(
         &self,
         saml_response: &str,
         expected_request_id: Option<&str>,
-    ) -> Result<SamlAssertion> {
+    ) -> Result<(SamlAssertion, DateTime<Utc>)> {
         use samael::service_provider::ServiceProviderBuilder;
 
         // 1. Use the IdP metadata parsed once at construction. The signing certificate(s)
@@ -641,14 +792,36 @@ impl SamlServiceProvider {
             .as_ref()
             .and_then(|conditions| conditions.not_on_or_after);
 
-        Ok(SamlAssertion {
-            name_id,
-            name_id_format,
-            session_index,
-            attributes,
-            issue_instant: assertion.issue_instant,
-            not_on_or_after,
-        })
+        if assertion.id.is_empty() {
+            return Err(AuthError::SamlValidation(
+                "SAML assertion is missing its ID".to_string(),
+            ));
+        }
+
+        let confirmation_expiries = subject
+            .and_then(|s| s.subject_confirmations.as_ref())
+            .into_iter()
+            .flatten()
+            .filter_map(|c| c.subject_confirmation_data.as_ref())
+            .filter_map(|d| d.not_on_or_after);
+        let expires_at = not_on_or_after
+            .into_iter()
+            .chain(confirmation_expiries)
+            .min()
+            .unwrap_or_else(|| Utc::now() + REPLAY_MAX_TTL);
+
+        Ok((
+            SamlAssertion {
+                assertion_id: assertion.id.clone(),
+                name_id,
+                name_id_format,
+                session_index,
+                attributes,
+                issue_instant: assertion.issue_instant,
+                not_on_or_after,
+            },
+            expires_at,
+        ))
     }
 }
 
@@ -935,7 +1108,9 @@ mod saml_verification_tests {
         let provider = provider_from(&fixture.idp_metadata_xml, allow_unsigned);
         // Correlated validation is the supported path: the SP knows which
         // AuthnRequest it issued, so the response must answer that one.
-        provider.validate_response_with_request_id(&fixture.response_b64, REQUEST_ID, None, None)
+        provider
+            .validate_response(&fixture.response_b64, REQUEST_ID, None, None)
+            .await
     }
 
     // (a) A validly-signed response is accepted, and the returned NameID, attributes and
@@ -1056,7 +1231,8 @@ mod saml_verification_tests {
         let fixture = mint(MintOptions::default());
         let provider = provider_from(&metadata, false);
         let err = provider
-            .validate_response_with_request_id(&fixture.response_b64, REQUEST_ID, None, None)
+            .validate_response(&fixture.response_b64, REQUEST_ID, None, None)
+            .await
             .expect_err("must refuse when no signing cert is configured");
         assert!(matches!(err, AuthError::SamlValidation(_)), "got {err:?}");
     }
@@ -1074,7 +1250,8 @@ mod saml_verification_tests {
         let provider =
             SamlServiceProvider::new("test-idp".to_string(), config).expect("provider build");
         let err = provider
-            .validate_response_with_request_id(&fixture.response_b64, REQUEST_ID, None, None)
+            .validate_response(&fixture.response_b64, REQUEST_ID, None, None)
+            .await
             .expect_err("missing required attribute must be rejected");
         assert!(matches!(err, AuthError::SamlValidation(_)), "got {err:?}");
     }
@@ -1087,12 +1264,8 @@ mod saml_verification_tests {
         let fixture = mint(MintOptions::default());
         let provider = provider_from(&fixture.idp_metadata_xml, false);
         let err = provider
-            .validate_response_with_request_id(
-                &fixture.response_b64,
-                "_some_other_request",
-                None,
-                None,
-            )
+            .validate_response(&fixture.response_b64, "_some_other_request", None, None)
+            .await
             .expect_err("InResponseTo must be correlated with the issued AuthnRequest");
         assert!(matches!(err, AuthError::SamlValidation(_)), "got {err:?}");
     }
@@ -1105,7 +1278,7 @@ mod saml_verification_tests {
         assert!(!provider.config.allow_idp_initiated);
 
         let err = provider
-            .validate_response(&fixture.response_b64)
+            .validate_unsolicited_response(&fixture.response_b64)
             .await
             .expect_err("IdP-initiated SSO must be opt-in");
         assert!(matches!(err, AuthError::SamlValidation(_)), "got {err:?}");
@@ -1126,7 +1299,7 @@ mod saml_verification_tests {
             SamlServiceProvider::new("test-idp".to_string(), config).expect("provider build");
 
         provider
-            .validate_response(&fixture.response_b64)
+            .validate_unsolicited_response(&fixture.response_b64)
             .await
             .expect("opted-in IdP-initiated SSO must be accepted");
     }
@@ -1139,33 +1312,108 @@ mod saml_verification_tests {
         let provider = provider_from(&fixture.idp_metadata_xml, false);
 
         let err = provider
-            .validate_response_with_request_id(
+            .validate_response(
                 &fixture.response_b64,
                 REQUEST_ID,
                 Some("issued-relay-state"),
                 Some("attacker-relay-state"),
             )
+            .await
             .expect_err("a mismatched RelayState must be rejected");
         assert!(matches!(err, AuthError::SamlValidation(_)), "got {err:?}");
 
         let err = provider
-            .validate_response_with_request_id(
+            .validate_response(
                 &fixture.response_b64,
                 REQUEST_ID,
                 Some("issued-relay-state"),
                 None,
             )
+            .await
             .expect_err("a missing RelayState must be rejected when one was issued");
         assert!(matches!(err, AuthError::SamlValidation(_)), "got {err:?}");
 
         provider
-            .validate_response_with_request_id(
+            .validate_response(
                 &fixture.response_b64,
                 REQUEST_ID,
                 Some("issued-relay-state"),
                 Some("issued-relay-state"),
             )
+            .await
             .expect("a matching RelayState must pass");
+    }
+
+    // M17: an accepted assertion cannot be presented a second time.
+    #[tokio::test]
+    async fn replayed_assertion_is_rejected() {
+        let fixture = mint(MintOptions::default());
+        let provider = provider_from(&fixture.idp_metadata_xml, false);
+
+        let first = provider
+            .validate_response(&fixture.response_b64, REQUEST_ID, None, None)
+            .await
+            .expect("first use is accepted");
+        assert!(!first.assertion_id.is_empty());
+
+        let err = provider
+            .validate_response(&fixture.response_b64, REQUEST_ID, None, None)
+            .await
+            .expect_err("second use of the same assertion must be rejected");
+        assert!(matches!(err, AuthError::SamlValidation(_)), "got {err:?}");
+    }
+
+    // The replay cache is shared through the trait object: a second provider
+    // instance using the same cache also rejects the replay.
+    #[tokio::test]
+    async fn replay_cache_is_pluggable_and_shared() {
+        let fixture = mint(MintOptions::default());
+        let cache: Arc<dyn AssertionReplayCache> = Arc::new(InMemoryReplayCache::new());
+        let a = provider_from(&fixture.idp_metadata_xml, false).with_replay_cache(cache.clone());
+        let b = provider_from(&fixture.idp_metadata_xml, false).with_replay_cache(cache);
+
+        a.validate_response(&fixture.response_b64, REQUEST_ID, None, None)
+            .await
+            .expect("first use is accepted");
+        assert!(
+            b.validate_response(&fixture.response_b64, REQUEST_ID, None, None)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn in_memory_replay_cache_expires_and_prunes() {
+        let cache = InMemoryReplayCache::new();
+        let past = Utc::now() - Duration::seconds(1);
+        let future = Utc::now() + Duration::hours(1);
+
+        assert!(cache.check_and_insert("a", future).await.unwrap());
+        assert!(!cache.check_and_insert("a", future).await.unwrap());
+
+        // An entry whose assertion already expired no longer blocks (the
+        // assertion itself is rejected by validation by then) and is pruned.
+        assert!(cache.check_and_insert("old", past).await.unwrap());
+        cache.prune_expired();
+        assert_eq!(cache.len(), 1);
+        assert!(cache.check_and_insert("old", future).await.unwrap());
+    }
+
+    #[test]
+    fn saml_config_debug_redacts_private_key() {
+        let config = SamlConfig::new(
+            SP_ENTITY_ID.to_string(),
+            ACS_URL.to_string(),
+            IdpMetadata::Xml("<x/>".to_string()),
+        )
+        .with_keys(
+            "CERT-PEM".to_string(),
+            "PRIVATE-KEY-PEM-MATERIAL".to_string(),
+        );
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("PRIVATE-KEY-PEM-MATERIAL"), "{debug}");
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("CERT-PEM"));
     }
 }
 
