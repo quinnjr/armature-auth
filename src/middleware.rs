@@ -12,6 +12,10 @@
 //! extensions), role- and permission-protected routes deny everyone, because
 //! a bare bearer token is never treated as proof of any role.
 //!
+//! Register it with `armature_core::Application::use_middleware`, which runs
+//! global middleware **before** module/controller/route guards, so the
+//! guards see the verified identity.
+//!
 //! # Two modes
 //!
 //! The middleware supports two policies, selected by the `require_auth` flag:
@@ -21,21 +25,51 @@
 //!   the downstream handler never runs. Use this to protect an entire route
 //!   subtree where anonymous access is never allowed.
 //! - **Optional auth** ([`JwtAuthMiddleware::optional`]): a valid token is
-//!   verified and its identity attached; a missing or invalid token is simply
-//!   passed through with **no** identity attached. The request still reaches
-//!   the handler chain, so a per-route guard downstream gets to make the
-//!   final allow/deny decision (typically returning `403` when it finds no
-//!   verified roles). Use this when some routes behind the middleware are
-//!   public and others are guarded.
+//!   verified and its identity attached; a missing token is passed through
+//!   with **no** identity attached. An *invalid* token is never forwarded as
+//!   if it were a credential: the `Authorization` header is stripped and a
+//!   [`RejectedCredentials`] marker extension is inserted instead, so nothing
+//!   downstream (e.g. a header-presence check) can mistake it for an
+//!   authenticated request. The request still reaches the handler chain, so a
+//!   per-route guard downstream makes the final allow/deny decision. Use this
+//!   when some routes behind the middleware are public and others are
+//!   guarded.
 //!
 //! In both modes a *valid* token results in a [`UserContext`] and a
 //! [`RequestRoles`] extension being inserted before the next handler runs.
+//! Only **access** tokens are accepted: refresh tokens minted by
+//! [`JwtManager::generate_token_pair`] (identified by their `token_use` claim
+//! and `typ` header) are rejected like any other invalid token, see
+//! [`JwtManager::verify_access`]. A token with no subject claim is rejected
+//! too, as is a request carrying more than one `Authorization` header.
 
 use crate::UserContext;
-use armature_core::{Error, HttpRequest, HttpResponse, Middleware, Next, RequestRoles};
+use armature_core::{
+    Error, HttpRequest, HttpResponse, Middleware, Next, RequestRoles, VerifiedIdentity,
+};
 use armature_jwt::JwtManager;
 use armature_log::{debug, trace};
 use async_trait::async_trait;
+
+/// Marker extension inserted by [`JwtAuthMiddleware`] in optional mode when
+/// the request presented a credential that failed verification (bad
+/// signature, expired, refresh token, malformed or duplicated header).
+///
+/// The offending `Authorization` header has already been removed. Handlers on
+/// public routes can use this to respond `401` with a `WWW-Authenticate`
+/// challenge rather than silently serving anonymous content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RejectedCredentials;
+
+/// What a request's `Authorization` header contained.
+enum Credential {
+    /// No `Authorization` header.
+    Absent,
+    /// A single `Bearer` credential.
+    Bearer(String),
+    /// Present but unusable: not `Bearer`, empty, non-UTF-8 or repeated.
+    Malformed,
+}
 
 /// Middleware that verifies a JWT bearer token and populates request-scoped
 /// identity for the authorization guards.
@@ -48,6 +82,8 @@ use async_trait::async_trait;
 ///    [`crate::PermissionGuard`].
 /// 2. An [`armature_core::RequestRoles`] built from the same roles, so the
 ///    core `armature_core::RolesGuard` works too.
+/// 3. An [`armature_core::VerifiedIdentity`] carrying the subject, which the
+///    core `armature_core::AuthenticationGuard` requires.
 ///
 /// # Configuration
 ///
@@ -72,7 +108,9 @@ use async_trait::async_trait;
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let rt = tokio::runtime::Runtime::new()?;
 /// rt.block_on(async {
-///     let manager = JwtManager::new(JwtConfig::new("secret".to_string()))?;
+///     let manager = JwtManager::new(JwtConfig::new(
+///         "kV9pQ2xR7tW4yZ1bN6mC3fH8jL5sD0gA".to_string(), // load from a secret store
+///     )?)?;
 ///     let exp = chrono::Utc::now().timestamp() + 3600;
 ///
 ///     // Mint a token that carries the `admin` role.
@@ -91,7 +129,7 @@ use async_trait::async_trait;
 ///     let make_next = |guard: RoleGuard| -> Next {
 ///         Box::new(move |req: HttpRequest| {
 ///             Box::pin(async move {
-///                 match guard.can_activate(&req).await {
+///                 match Guard::can_activate(&guard, &req).await {
 ///                     Ok(true) => Ok(HttpResponse::ok()),
 ///                     _ => Ok(HttpResponse::forbidden()),
 ///                 }
@@ -181,18 +219,36 @@ impl JwtAuthMiddleware {
         self
     }
 
-    /// Extract the bearer token from the `Authorization` header, if present.
-    fn bearer_token(req: &HttpRequest) -> Option<&str> {
-        let header = req
-            .headers
-            .get("authorization")
-            .or_else(|| req.headers.get("Authorization"))?;
-        header.strip_prefix("Bearer ").map(str::trim)
+    /// Classify the request's `Authorization` header.
+    ///
+    /// Header lookup is case-insensitive, and a repeated header is refused
+    /// rather than resolved by picking one (see `HeaderMap::get_unique`).
+    fn credential(req: &HttpRequest) -> Credential {
+        let value = match req.headers.get_unique("authorization") {
+            Ok(None) => return Credential::Absent,
+            Ok(Some(value)) => value,
+            Err(_) => return Credential::Malformed,
+        };
+        let Ok(value) = std::str::from_utf8(value) else {
+            return Credential::Malformed;
+        };
+        let token = match value.split_once(' ') {
+            Some((scheme, token)) if scheme.eq_ignore_ascii_case("bearer") => token.trim(),
+            _ => return Credential::Malformed,
+        };
+        if token.is_empty() {
+            Credential::Malformed
+        } else {
+            Credential::Bearer(token.to_string())
+        }
     }
 
-    /// Verify `token` and build a [`UserContext`] from its claims.
+    /// Verify `token` as an access token and build a [`UserContext`] from
+    /// its claims.
     fn context_from_token(&self, token: &str) -> Option<UserContext> {
-        let claims: serde_json::Value = match self.manager.verify(token) {
+        // `verify_access` also rejects refresh tokens, which carry the same
+        // identity and roles but a much longer lifetime.
+        let claims: serde_json::Value = match self.manager.verify_access(token) {
             Ok(claims) => claims,
             Err(e) => {
                 debug!("JWT verification failed: {}", e);
@@ -200,11 +256,16 @@ impl JwtAuthMiddleware {
             }
         };
 
-        let subject = claims
+        let subject = match claims
             .get(&self.subject_claim)
             .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string();
+        {
+            Some(subject) if !subject.is_empty() => subject.to_string(),
+            _ => {
+                debug!("JWT has no `{}` claim; rejecting", self.subject_claim);
+                return None;
+            }
+        };
 
         let roles = string_list(claims.get(&self.roles_claim));
         let permissions = string_list(claims.get(&self.permissions_claim));
@@ -227,39 +288,44 @@ impl JwtAuthMiddleware {
     /// request's extensions.
     fn attach(req: &mut HttpRequest, context: UserContext) {
         let roles = RequestRoles::new(context.roles.clone());
+        let identity = VerifiedIdentity::new(context.user_id.clone());
         req.extensions.insert(context);
         req.extensions.insert(roles);
+        req.extensions.insert(identity);
     }
 }
 
 #[async_trait]
 impl Middleware for JwtAuthMiddleware {
     async fn handle(&self, mut req: HttpRequest, next: Next) -> Result<HttpResponse, Error> {
-        match Self::bearer_token(&req).map(str::to_string) {
-            Some(token) => match self.context_from_token(&token) {
-                Some(context) => {
-                    Self::attach(&mut req, context);
-                    next(req).await
-                }
-                // Token present but invalid/expired.
-                None => {
-                    if self.require_auth {
-                        debug!("Rejecting request with invalid token (require_auth)");
-                        Ok(HttpResponse::unauthorized())
-                    } else {
-                        // Optional mode: attach nothing, let a guard decide.
-                        next(req).await
-                    }
-                }
-            },
-            // No bearer token at all.
-            None => {
+        let context = match Self::credential(&req) {
+            Credential::Absent => {
                 if self.require_auth {
                     debug!("Rejecting request with no bearer token (require_auth)");
-                    Ok(HttpResponse::unauthorized())
-                } else {
-                    next(req).await
+                    return Ok(HttpResponse::unauthorized());
                 }
+                return next(req).await;
+            }
+            Credential::Bearer(token) => self.context_from_token(&token),
+            Credential::Malformed => None,
+        };
+
+        match context {
+            Some(context) => {
+                Self::attach(&mut req, context);
+                next(req).await
+            }
+            // Credential present but invalid/expired/refresh/malformed.
+            None if self.require_auth => {
+                debug!("Rejecting request with invalid credential (require_auth)");
+                Ok(HttpResponse::unauthorized())
+            }
+            None => {
+                // Optional mode: never forward a rejected credential as if it
+                // were one. Strip it and flag the request instead.
+                req.headers.remove_all("authorization");
+                req.extensions.insert(RejectedCredentials);
+                next(req).await
             }
         }
     }
@@ -283,14 +349,15 @@ fn string_list(value: Option<&serde_json::Value>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{OTHER_TEST_JWT_SECRET, TEST_JWT_SECRET};
     use crate::{Guard, RoleGuard};
-    use armature_core::guard::{Guard as CoreGuard, GuardContext, RolesGuard};
+    use armature_core::guard::{AuthenticationGuard, Guard as CoreGuard, GuardContext, RolesGuard};
     use armature_jwt::JwtConfig;
     use serde_json::json;
     use std::pin::Pin;
 
     fn manager() -> JwtManager {
-        JwtManager::new(JwtConfig::new("test-secret".to_string())).unwrap()
+        JwtManager::new(JwtConfig::new(TEST_JWT_SECRET.to_string()).unwrap()).unwrap()
     }
 
     fn token_with(manager: &JwtManager, claims: serde_json::Value) -> String {
@@ -316,7 +383,7 @@ mod tests {
     fn role_guard_next(guard: RoleGuard) -> Next {
         Box::new(move |req: HttpRequest| {
             Box::pin(async move {
-                match guard.can_activate(&req).await {
+                match Guard::can_activate(&guard, &req).await {
                     Ok(true) => Ok(HttpResponse::ok()),
                     _ => Ok(HttpResponse::forbidden()),
                 }
@@ -375,7 +442,8 @@ mod tests {
 
     #[tokio::test]
     async fn token_signed_with_wrong_secret_is_rejected() {
-        let signer = JwtManager::new(JwtConfig::new("other-secret".to_string())).unwrap();
+        let signer =
+            JwtManager::new(JwtConfig::new(OTHER_TEST_JWT_SECRET.to_string()).unwrap()).unwrap();
         let token = admin_token(&signer);
 
         // Verifier uses a different secret -> signature check fails.
@@ -392,16 +460,158 @@ mod tests {
         let next = role_guard_next(RoleGuard::any(vec!["admin".to_string()]));
 
         // No token: optional mode attaches nothing and forwards to the guard,
-        // which fails closed because no verified roles are present.
+        // which fails closed because no verified identity is present.
         let req = HttpRequest::new("GET", "/admin".to_string());
-        // Give it a bearer header so the guard's auth precheck passes and we
-        // exercise the "no verified roles" fail-closed path specifically.
-        let mut req_with_header = req;
-        req_with_header
-            .headers
-            .insert("authorization", "Bearer ".to_string());
-        let resp = mw.handle(req_with_header, next).await.unwrap();
+        let resp = mw.handle(req, next).await.unwrap();
         assert_eq!(resp.status, 403);
+    }
+
+    /// A `next` that reports what reached the handler: whether an
+    /// Authorization header survived and whether the request was flagged.
+    fn inspecting_next() -> Next {
+        Box::new(move |req: HttpRequest| {
+            Box::pin(async move {
+                let header = req.headers.get("authorization").is_some();
+                let flagged = req.extensions.get::<RejectedCredentials>().is_some();
+                let identity = req.extensions.get::<UserContext>().is_some();
+                Ok(HttpResponse::ok()
+                    .with_header("x-had-auth".to_string(), header.to_string())
+                    .with_header("x-flagged".to_string(), flagged.to_string())
+                    .with_header("x-identity".to_string(), identity.to_string()))
+            }) as Pin<Box<_>>
+        })
+    }
+
+    #[tokio::test]
+    async fn optional_mode_strips_and_flags_invalid_token() {
+        let mw = JwtAuthMiddleware::optional(manager());
+        let resp = mw
+            .handle(bearer_request("not.a.valid.token"), inspecting_next())
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.headers.get("x-had-auth").map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            resp.headers.get("x-flagged").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            resp.headers.get("x-identity").map(String::as_str),
+            Some("false")
+        );
+    }
+
+    #[tokio::test]
+    async fn optional_mode_strips_and_flags_malformed_header() {
+        let mw = JwtAuthMiddleware::optional(manager());
+        let mut req = HttpRequest::new("GET", "/".to_string());
+        req.headers
+            .insert("authorization", "Basic YWxhZGRpbjpvcGVu".to_string());
+        let resp = mw.handle(req, inspecting_next()).await.unwrap();
+        assert_eq!(
+            resp.headers.get("x-had-auth").map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            resp.headers.get("x-flagged").map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_token_is_rejected_as_bearer() {
+        let manager = manager();
+        let pair = manager
+            .generate_token_pair(&json!({ "sub": "user123", "roles": ["admin"] }))
+            .unwrap();
+        let mw = JwtAuthMiddleware::new(manager.clone());
+
+        let resp = mw
+            .handle(
+                bearer_request(&pair.refresh_token),
+                role_guard_next(RoleGuard::any(vec!["admin".to_string()])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status, 401, "refresh token must not authenticate");
+
+        let resp = mw
+            .handle(
+                bearer_request(&pair.access_token),
+                role_guard_next(RoleGuard::any(vec!["admin".to_string()])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status, 200);
+
+        // Optional mode: flagged, not authenticated.
+        let mw = JwtAuthMiddleware::optional(manager);
+        let resp = mw
+            .handle(bearer_request(&pair.refresh_token), inspecting_next())
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.headers.get("x-identity").map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            resp.headers.get("x-flagged").map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[tokio::test]
+    async fn token_without_subject_is_rejected() {
+        let manager = manager();
+        let exp = chrono::Utc::now().timestamp() + 3600;
+        let token = token_with(&manager, json!({ "roles": ["admin"], "exp": exp }));
+        let mw = JwtAuthMiddleware::new(manager);
+        let resp = mw
+            .handle(
+                bearer_request(&token),
+                role_guard_next(RoleGuard::any(vec!["admin".to_string()])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status, 401);
+    }
+
+    #[tokio::test]
+    async fn duplicate_authorization_headers_are_rejected() {
+        let manager = manager();
+        let token = admin_token(&manager);
+        let mw = JwtAuthMiddleware::new(manager);
+        let mut req = bearer_request(&token);
+        req.headers
+            .append("authorization", format!("Bearer {token}"));
+        let resp = mw
+            .handle(
+                req,
+                role_guard_next(RoleGuard::any(vec!["admin".to_string()])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status, 401);
+    }
+
+    #[tokio::test]
+    async fn bearer_scheme_is_case_insensitive() {
+        let manager = manager();
+        let token = admin_token(&manager);
+        let mw = JwtAuthMiddleware::new(manager);
+        let mut req = HttpRequest::new("GET", "/admin".to_string());
+        req.headers
+            .insert("Authorization", format!("bearer {token}"));
+        let resp = mw
+            .handle(
+                req,
+                role_guard_next(RoleGuard::any(vec!["admin".to_string()])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status, 200);
     }
 
     #[tokio::test]
@@ -427,6 +637,32 @@ mod tests {
                 let guard = RolesGuard::new(vec!["admin".to_string()]);
                 let ctx = GuardContext::new(req);
                 match guard.can_activate(&ctx).await {
+                    Ok(true) => Ok(HttpResponse::ok()),
+                    _ => Ok(HttpResponse::forbidden()),
+                }
+            }) as Pin<Box<_>>
+        });
+
+        let resp = mw.handle(bearer_request(&token), next).await.unwrap();
+        assert_eq!(resp.status, 200);
+    }
+
+    #[tokio::test]
+    async fn populates_verified_identity_for_core_authentication_guard() {
+        let manager = manager();
+        let token = admin_token(&manager);
+        let mw = JwtAuthMiddleware::new(manager);
+
+        let next: Next = Box::new(move |req: HttpRequest| {
+            Box::pin(async move {
+                assert_eq!(
+                    req.extensions
+                        .get::<VerifiedIdentity>()
+                        .map(|i| i.subject.as_str()),
+                    Some("user123")
+                );
+                let ctx = GuardContext::new(req);
+                match AuthenticationGuard.can_activate(&ctx).await {
                     Ok(true) => Ok(HttpResponse::ok()),
                     _ => Ok(HttpResponse::forbidden()),
                 }

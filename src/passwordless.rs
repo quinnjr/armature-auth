@@ -11,32 +11,45 @@
 //!
 //! # Usage
 //!
-//! ```no_run
+//! Only a SHA-256 hash of a magic-link token is ever stored. The plaintext
+//! exists once, in the [`IssuedMagicLink`] returned by
+//! [`MagicLinkToken::generate`], to be put in the e-mailed URL. Redemption
+//! goes through [`redeem_magic_link`], which consumes the record atomically
+//! via [`MagicLinkStore::consume`], so a link can be used at most once even
+//! under concurrent clicks.
+//!
+//! ```
 //! use armature_auth::passwordless::*;
 //!
-//! # async fn example(presented_token: &str) -> Result<(), PasswordlessError> {
-//! // Issue the link and store the record (keyed by identifier) somewhere the
-//! // callback can load it from.
-//! let mut token = MagicLinkToken::generate("user@example.com", std::time::Duration::from_secs(3600))?;
-//! let link = format!("https://myapp.com/auth/verify?token={}", token.token);
+//! # #[tokio::main(flavor = "current_thread")]
+//! # async fn main() -> Result<(), PasswordlessError> {
+//! let store = InMemoryMagicLinkStore::new();
+//!
+//! // Issue the link and store the (hashed) record.
+//! let issued = MagicLinkToken::generate("user@example.com", std::time::Duration::from_secs(900))?;
+//! store.save(&issued.record).await?;
+//! let link = issued.to_url("https://myapp.com/auth/verify");
 //!
 //! // Send link via email...
+//! # let presented = issued.secret().to_string();
 //!
-//! // In the callback: check the token the caller actually presented against
-//! // the stored record. `verify_token` does the constant-time comparison as
-//! // well as the expiry/single-use checks — the login decision must never be
-//! // made without comparing the secret.
-//! if token.verify_token(presented_token)? {
-//!     token.mark_used(); // persist this, or the link stays redeemable
-//!     println!("Magic link valid!");
-//! }
+//! // In the callback: verify and consume in one step.
+//! let record = redeem_magic_link(&store, &presented).await?;
+//! assert_eq!(record.identifier, "user@example.com");
+//!
+//! // Replaying the same link fails.
+//! assert!(redeem_magic_link(&store, &presented).await.is_err());
 //! # Ok(())
 //! # }
 //! ```
 
+use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
+use dashmap::DashMap;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fmt;
 use thiserror::Error;
 
 #[cfg(feature = "webauthn")]
@@ -59,15 +72,20 @@ pub enum PasswordlessError {
 
     #[error("Feature not enabled: {0}")]
     FeatureNotEnabled(&'static str),
+
+    #[error("Magic link storage error: {0}")]
+    Storage(String),
 }
 
-/// Magic Link Token
+/// A stored magic-link record.
 ///
-/// Time-limited token for passwordless authentication via email.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Holds only [`token_hash`](Self::token_hash) (hex SHA-256 of the token),
+/// never the token, so a leaked record table cannot be replayed. The tokens
+/// are 256-bit random values, so an unkeyed hash is not brute-forceable.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct MagicLinkToken {
-    /// The token string
-    pub token: String,
+    /// Hex SHA-256 of the token; the store's lookup key.
+    pub token_hash: String,
 
     /// User identifier (email, user ID, etc.)
     pub identifier: String,
@@ -82,6 +100,50 @@ pub struct MagicLinkToken {
     pub used: bool,
 }
 
+impl fmt::Debug for MagicLinkToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MagicLinkToken")
+            .field("token_hash", &"<redacted>")
+            .field("identifier", &self.identifier)
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .field("used", &self.used)
+            .finish()
+    }
+}
+
+/// A freshly issued magic link: the record to store plus the plaintext token,
+/// which exists only here.
+///
+/// The token is redacted from `Debug` and this type is not `Serialize`.
+#[derive(Clone)]
+pub struct IssuedMagicLink {
+    /// The record to persist (hash only).
+    pub record: MagicLinkToken,
+    token: String,
+}
+
+impl IssuedMagicLink {
+    /// The plaintext token to embed in the link.
+    pub fn secret(&self) -> &str {
+        &self.token
+    }
+
+    /// Create the verification URL (`{base_url}?token={token}`).
+    pub fn to_url(&self, base_url: &str) -> String {
+        format!("{}?token={}", base_url, self.token)
+    }
+}
+
+impl fmt::Debug for IssuedMagicLink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IssuedMagicLink")
+            .field("record", &self.record)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
 impl MagicLinkToken {
     /// Generate a new magic link token
     ///
@@ -91,19 +153,20 @@ impl MagicLinkToken {
     /// use armature_auth::passwordless::*;
     ///
     /// # fn example() -> Result<(), PasswordlessError> {
-    /// let token = MagicLinkToken::generate(
+    /// let issued = MagicLinkToken::generate(
     ///     "user@example.com",
     ///     std::time::Duration::from_secs(3600) // 1 hour
     /// )?;
     ///
-    /// println!("Token: {}", token.token);
+    /// // Store `issued.record`; e-mail `issued.to_url(..)`.
+    /// assert_ne!(issued.record.token_hash, issued.secret());
     /// # Ok(())
     /// # }
     /// ```
     pub fn generate(
         identifier: impl Into<String>,
         ttl: std::time::Duration,
-    ) -> Result<Self, PasswordlessError> {
+    ) -> Result<IssuedMagicLink, PasswordlessError> {
         let mut rng = rand::rng();
         let bytes: Vec<u8> = (0..32).map(|_| rng.random()).collect();
         let token = hex::encode(bytes);
@@ -112,13 +175,21 @@ impl MagicLinkToken {
         let expires_at =
             now + Duration::from_std(ttl).map_err(|_| PasswordlessError::InvalidToken)?;
 
-        Ok(Self {
+        Ok(IssuedMagicLink {
+            record: Self {
+                token_hash: Self::hash_token(&token),
+                identifier: identifier.into(),
+                created_at: now,
+                expires_at,
+                used: false,
+            },
             token,
-            identifier: identifier.into(),
-            created_at: now,
-            expires_at,
-            used: false,
         })
+    }
+
+    /// The stored form of a token: hex SHA-256.
+    pub fn hash_token(token: &str) -> String {
+        hex::encode(Sha256::digest(token.as_bytes()))
     }
 
     /// Check that this token is still redeemable — **not** that the caller
@@ -128,11 +199,8 @@ impl MagicLinkToken {
     /// - Not already used
     /// - Not expired
     ///
-    /// This answers a question about the stored record only. It takes no
-    /// candidate and therefore compares no secret, so on its own it authorises
-    /// nothing: any caller who can name the identifier could log in. To
-    /// authenticate a click on a magic link, look the record up and pass the
-    /// token from the URL to [`Self::verify_token`].
+    /// This answers a question about the stored record only; it authorises
+    /// nothing. Use [`redeem_magic_link`] (or [`Self::consume`]) to log in.
     pub fn is_usable(&self) -> Result<bool, PasswordlessError> {
         if self.used {
             return Err(PasswordlessError::TokenUsed);
@@ -145,65 +213,98 @@ impl MagicLinkToken {
         Ok(true)
     }
 
-    /// Verify a token presented by a caller against this stored record.
+    /// Verify `candidate` against this record and mark it used, in one step.
     ///
-    /// This is the login check: it compares `candidate` against the issued
-    /// token in constant time (so the secret cannot be recovered a byte at a
-    /// time by timing the response) *and* enforces the single-use and expiry
-    /// rules.
-    ///
-    /// Returns `Err(InvalidToken)` when the candidate does not match, and the
-    /// corresponding error when the record is used or expired. On `Ok(true)`
-    /// the caller must persist [`Self::mark_used`] before completing the login,
-    /// otherwise the link stays redeemable.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use armature_auth::passwordless::*;
-    ///
-    /// # fn example() -> Result<(), PasswordlessError> {
-    /// let mut token = MagicLinkToken::generate(
-    ///     "user@example.com",
-    ///     std::time::Duration::from_secs(900),
-    /// )?;
-    ///
-    /// // The value that arrived in the callback URL.
-    /// let presented = token.token.clone();
-    ///
-    /// if token.verify_token(&presented)? {
-    ///     token.mark_used();
-    /// }
-    ///
-    /// // Replaying the same link no longer works.
-    /// assert!(token.verify_token(&presented).is_err());
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn verify_token(&self, candidate: &str) -> Result<bool, PasswordlessError> {
+    /// Compares the candidate's hash in constant time and enforces the
+    /// single-use and expiry rules. On `Ok(())` the record is marked used;
+    /// the caller must persist that before completing the login. When the
+    /// record lives in shared storage, prefer [`redeem_magic_link`], whose
+    /// [`MagicLinkStore::consume`] makes check-and-mark atomic across
+    /// concurrent requests.
+    pub fn consume(&mut self, candidate: &str) -> Result<(), PasswordlessError> {
         // Compare first and unconditionally, so a mismatched candidate is not
         // distinguishable from a used/expired one by which check ran.
-        let matches =
-            armature_core::crypto::constant_time_eq(candidate.as_bytes(), self.token.as_bytes());
+        let matches = armature_core::crypto::constant_time_eq(
+            Self::hash_token(candidate).as_bytes(),
+            self.token_hash.as_bytes(),
+        );
 
-        self.is_usable()?;
-
-        if matches {
-            Ok(true)
-        } else {
-            Err(PasswordlessError::InvalidToken)
+        if !matches {
+            return Err(PasswordlessError::InvalidToken);
         }
-    }
-
-    /// Mark token as used
-    pub fn mark_used(&mut self) {
+        self.is_usable()?;
         self.used = true;
+        Ok(())
+    }
+}
+
+/// Storage for magic-link records.
+#[async_trait]
+pub trait MagicLinkStore: Send + Sync {
+    /// Persist a newly issued record.
+    async fn save(&self, record: &MagicLinkToken) -> Result<(), PasswordlessError>;
+
+    /// **Atomically** claim the record with this `token_hash`: return it and
+    /// make sure no later `consume` for the same hash returns it unused
+    /// (delete it, or mark it used, in the same operation — e.g.
+    /// `DELETE … RETURNING`, Redis `GETDEL`, or a compare-and-set on `used`).
+    ///
+    /// Returns `None` if no such record exists. Returning a record whose
+    /// `used` flag is set (e.g. a marked-not-deleted design) is allowed; the
+    /// caller rejects it.
+    async fn consume(&self, token_hash: &str) -> Result<Option<MagicLinkToken>, PasswordlessError>;
+}
+
+/// In-process [`MagicLinkStore`]. Records are per-process; use a shared store
+/// for multi-instance deployments.
+#[derive(Default)]
+pub struct InMemoryMagicLinkStore {
+    records: DashMap<String, MagicLinkToken>,
+}
+
+impl InMemoryMagicLinkStore {
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// Create verification URL
-    pub fn to_url(&self, base_url: &str) -> String {
-        format!("{}?token={}", base_url, self.token)
+    /// Drop expired records.
+    pub fn prune_expired(&self) {
+        let now = Utc::now();
+        self.records.retain(|_, r| r.expires_at >= now);
     }
+}
+
+#[async_trait]
+impl MagicLinkStore for InMemoryMagicLinkStore {
+    async fn save(&self, record: &MagicLinkToken) -> Result<(), PasswordlessError> {
+        self.records
+            .insert(record.token_hash.clone(), record.clone());
+        Ok(())
+    }
+
+    async fn consume(&self, token_hash: &str) -> Result<Option<MagicLinkToken>, PasswordlessError> {
+        // `remove` is atomic per shard: exactly one concurrent caller gets it.
+        Ok(self.records.remove(token_hash).map(|(_, record)| record))
+    }
+}
+
+/// Redeem a presented magic-link token: look it up by hash, atomically
+/// consume it, and check it is unused and unexpired.
+///
+/// Returns the consumed record (with `used == true`) on success. Every
+/// failure — unknown token, already used, expired — consumes nothing further
+/// and returns an error.
+pub async fn redeem_magic_link(
+    store: &dyn MagicLinkStore,
+    presented: &str,
+) -> Result<MagicLinkToken, PasswordlessError> {
+    let hash = MagicLinkToken::hash_token(presented);
+    let mut record = store
+        .consume(&hash)
+        .await?
+        .ok_or(PasswordlessError::InvalidToken)?;
+    record.consume(presented)?;
+    Ok(record)
 }
 
 /// WebAuthn Configuration
@@ -351,102 +452,135 @@ impl WebAuthnManager {
 mod tests {
     use super::*;
 
+    fn issue(ttl_secs: u64) -> IssuedMagicLink {
+        MagicLinkToken::generate("user@example.com", std::time::Duration::from_secs(ttl_secs))
+            .unwrap()
+    }
+
     #[test]
     fn test_generate_magic_link() {
-        let token =
-            MagicLinkToken::generate("user@example.com", std::time::Duration::from_secs(3600))
-                .unwrap();
-
-        assert!(!token.token.is_empty());
-        assert_eq!(token.identifier, "user@example.com");
-        assert!(!token.used);
+        let issued = issue(3600);
+        assert_eq!(issued.secret().len(), 64);
+        assert_eq!(issued.record.identifier, "user@example.com");
+        assert!(!issued.record.used);
     }
 
     #[test]
-    fn test_verify_magic_link() {
-        let token =
-            MagicLinkToken::generate("user@example.com", std::time::Duration::from_secs(3600))
-                .unwrap();
-
-        assert!(token.is_usable().is_ok());
+    fn record_stores_only_a_hash() {
+        let issued = issue(3600);
+        let json = serde_json::to_string(&issued.record).unwrap();
+        assert!(!json.contains(issued.secret()), "{json}");
+        assert_eq!(
+            issued.record.token_hash,
+            MagicLinkToken::hash_token(issued.secret())
+        );
+        let debug = format!("{issued:?}");
+        assert!(!debug.contains(issued.secret()), "{debug}");
+        assert!(!debug.contains(&issued.record.token_hash), "{debug}");
     }
 
     #[test]
-    fn test_verify_token_requires_the_presented_secret() {
-        // The login check must compare the value the caller presented. A check
-        // that only inspects `used`/`expires_at` authorises anyone who can name
-        // the identifier.
-        let token =
-            MagicLinkToken::generate("user@example.com", std::time::Duration::from_secs(3600))
-                .unwrap();
-
-        assert!(token.verify_token(&token.token).unwrap());
+    fn consume_requires_the_presented_secret() {
+        let issued = issue(3600);
+        let mut record = issued.record.clone();
         assert!(matches!(
-            token.verify_token("not-the-token"),
+            record.consume("not-the-token"),
             Err(PasswordlessError::InvalidToken)
         ));
+        // The stored hash itself is not a valid token.
+        let hash = record.token_hash.clone();
         assert!(matches!(
-            token.verify_token(""),
+            record.consume(&hash),
             Err(PasswordlessError::InvalidToken)
         ));
-    }
-
-    #[test]
-    fn test_verify_token_rejects_used_and_expired() {
-        let mut token =
-            MagicLinkToken::generate("user@example.com", std::time::Duration::from_secs(3600))
-                .unwrap();
-        let presented = token.token.clone();
-        token.mark_used();
+        assert!(!record.used);
+        record.consume(issued.secret()).unwrap();
+        assert!(record.used);
         assert!(matches!(
-            token.verify_token(&presented),
+            record.consume(issued.secret()),
             Err(PasswordlessError::TokenUsed)
         ));
+    }
 
-        let token = MagicLinkToken::generate("user@example.com", std::time::Duration::from_secs(0))
-            .unwrap();
+    #[test]
+    fn consume_rejects_expired() {
+        let issued = issue(0);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let mut record = issued.record.clone();
+        assert!(matches!(
+            record.consume(issued.secret()),
+            Err(PasswordlessError::TokenExpired)
+        ));
+    }
+
+    #[tokio::test]
+    async fn redeem_is_single_use() {
+        let store = InMemoryMagicLinkStore::new();
+        let issued = issue(3600);
+        store.save(&issued.record).await.unwrap();
+
+        let record = redeem_magic_link(&store, issued.secret()).await.unwrap();
+        assert!(record.used);
+        assert!(matches!(
+            redeem_magic_link(&store, issued.secret()).await,
+            Err(PasswordlessError::InvalidToken)
+        ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_redeem_succeeds_exactly_once() {
+        let store = std::sync::Arc::new(InMemoryMagicLinkStore::new());
+        let issued = issue(3600);
+        store.save(&issued.record).await.unwrap();
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let store = store.clone();
+            let token = issued.secret().to_string();
+            handles.push(tokio::spawn(async move {
+                redeem_magic_link(store.as_ref(), &token).await.is_ok()
+            }));
+        }
+        let mut successes = 0;
+        for h in handles {
+            if h.await.unwrap() {
+                successes += 1;
+            }
+        }
+        assert_eq!(successes, 1);
+    }
+
+    #[tokio::test]
+    async fn redeem_rejects_expired() {
+        let store = InMemoryMagicLinkStore::new();
+        let issued = issue(0);
+        store.save(&issued.record).await.unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
         assert!(matches!(
-            token.verify_token(&token.token),
+            redeem_magic_link(&store, issued.secret()).await,
             Err(PasswordlessError::TokenExpired)
         ));
     }
 
     #[test]
     fn test_magic_link_url() {
-        let token =
-            MagicLinkToken::generate("user@example.com", std::time::Duration::from_secs(3600))
-                .unwrap();
-
-        let url = token.to_url("https://example.com/auth/verify");
-        assert!(url.starts_with("https://example.com/auth/verify?token="));
+        let issued = issue(3600);
+        let url = issued.to_url("https://example.com/auth/verify");
+        assert_eq!(
+            url,
+            format!("https://example.com/auth/verify?token={}", issued.secret())
+        );
     }
 
     #[test]
-    fn test_magic_link_used() {
-        let mut token =
-            MagicLinkToken::generate("user@example.com", std::time::Duration::from_secs(3600))
-                .unwrap();
-
-        token.mark_used();
+    fn test_is_usable() {
+        let issued = issue(3600);
+        assert!(issued.record.is_usable().is_ok());
+        let mut used = issued.record.clone();
+        used.used = true;
         assert!(matches!(
-            token.is_usable(),
+            used.is_usable(),
             Err(PasswordlessError::TokenUsed)
-        ));
-    }
-
-    #[test]
-    fn test_expired_magic_link() {
-        let token = MagicLinkToken::generate(
-            "user@example.com",
-            std::time::Duration::from_secs(0), // Already expired
-        )
-        .unwrap();
-
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        assert!(matches!(
-            token.is_usable(),
-            Err(PasswordlessError::TokenExpired)
         ));
     }
 }

@@ -2,7 +2,7 @@
 
 use crate::password::PasswordHasher;
 use crate::user::UserContext;
-use crate::{AuthError, AuthUser, PasswordVerifier, Result};
+use crate::{AuthError, AuthUser, Result};
 use armature_jwt::JwtManager;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,17 @@ pub trait AuthStrategy<T: AuthUser>: Send + Sync {
 pub trait LocalUserStore<T: AuthUser>: Send + Sync {
     /// Find a user and their password hash by username.
     async fn find_by_username(&self, username: &str) -> Result<Option<(T, String)>>;
+
+    /// Replace a user's stored password hash.
+    ///
+    /// Called by [`LocalStrategy`] after a successful login whose stored hash
+    /// [`needs_rehash`](PasswordHasher::needs_rehash) (legacy algorithm or
+    /// weaker cost parameters), with a fresh hash of the just-verified
+    /// password. The default does nothing; override it to upgrade hashes
+    /// transparently on login. Errors are logged and do not fail the login.
+    async fn update_password_hash(&self, _username: &str, _new_hash: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Local authentication strategy (username/password).
@@ -85,14 +96,22 @@ impl<T: AuthUser> LocalStrategy<T> {
     /// bcrypt are deliberately slow — which turns the login endpoint into an
     /// account-enumeration oracle measurable over the network. Verifying
     /// against a fixed dummy hash makes both paths cost the same.
-    fn equalize_timing(&self, password: &str) {
-        let dummy = self
-            .dummy_hash
-            // codeql[rust/hard-coded-cryptographic-value]
-            .get_or_init(|| self.hasher.hash(DUMMY_PASSWORD).unwrap_or_default());
+    async fn equalize_timing(&self, password: &str) {
+        let dummy = match self.dummy_hash.get() {
+            Some(dummy) => dummy.clone(),
+            None => {
+                // codeql[rust/hard-coded-cryptographic-value]
+                let hash = self
+                    .hasher
+                    .hash_async(DUMMY_PASSWORD)
+                    .await
+                    .unwrap_or_default();
+                self.dummy_hash.get_or_init(|| hash).clone()
+            }
+        };
 
         if !dummy.is_empty() {
-            let _ = self.hasher.verify(password, dummy);
+            let _ = self.hasher.verify_async(password, &dummy).await;
         }
     }
 }
@@ -115,34 +134,64 @@ impl<T: AuthUser + 'static> AuthStrategy<T> for LocalStrategy<T> {
             })?;
 
         let Some(store) = self.store.as_ref() else {
-            self.equalize_timing(&creds.password);
+            self.equalize_timing(&creds.password).await;
             return Err(AuthError::InvalidCredentials);
         };
 
         let Some((user, password_hash)) = store.find_by_username(&creds.username).await? else {
             // An unknown username must cost what a known one costs; see
             // `equalize_timing`.
-            self.equalize_timing(&creds.password);
+            self.equalize_timing(&creds.password).await;
             return Err(AuthError::InvalidCredentials);
         };
 
-        if self.hasher.verify(&creds.password, &password_hash)? {
-            Ok(user)
-        } else {
-            Err(AuthError::InvalidCredentials)
+        // The KDF runs on the blocking pool, not on a runtime worker.
+        if !self
+            .hasher
+            .verify_async(&creds.password, &password_hash)
+            .await?
+        {
+            return Err(AuthError::InvalidCredentials);
         }
+
+        if self.hasher.needs_rehash(&password_hash) {
+            match self.hasher.hash_async(&creds.password).await {
+                Ok(new_hash) => {
+                    if let Err(e) = store.update_password_hash(&creds.username, &new_hash).await {
+                        armature_log::warn!("password rehash-on-login failed to persist: {}", e);
+                    }
+                }
+                Err(e) => armature_log::warn!("password rehash-on-login failed: {}", e),
+            }
+        }
+
+        Ok(user)
     }
 }
 
-/// Local credentials
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Local credentials.
+///
+/// The password is redacted from `Debug` output and never serialized (it is
+/// still deserialized, so a login request body can be parsed into this type).
+#[derive(Clone, Serialize, Deserialize)]
 pub struct LocalCredentials {
     pub username: String,
+    #[serde(skip_serializing)]
     pub password: String,
 }
 
-/// JWT authentication strategy: verifies a bearer token via
-/// [`armature_jwt::JwtManager`] and builds a [`UserContext`] from its claims,
+impl std::fmt::Debug for LocalCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalCredentials")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+/// JWT authentication strategy: verifies a bearer **access** token via
+/// [`armature_jwt::JwtManager::verify_access`] (refresh tokens are rejected)
+/// and builds a [`UserContext`] from its claims,
 /// the same mapping [`crate::JwtAuthMiddleware`] uses (`sub`, `roles`,
 /// `permissions`).
 pub struct JwtStrategy<T: AuthUser> {
@@ -182,7 +231,10 @@ impl AuthStrategy<UserContext> for JwtStrategy<UserContext> {
                 )
             })?;
 
-        let claims: serde_json::Value = self.jwt_manager.verify(token)?;
+        // `verify_access` rejects refresh tokens (`token_use` / `typ`), which
+        // carry the same identity but must only ever be exchanged at the
+        // refresh endpoint.
+        let claims: serde_json::Value = self.jwt_manager.verify_access(token)?;
 
         let subject = claims
             .get("sub")
@@ -212,15 +264,24 @@ fn string_list(value: Option<&serde_json::Value>) -> Vec<String> {
     }
 }
 
-/// JWT credentials
-#[derive(Debug, Clone)]
+/// JWT credentials. The token is redacted from `Debug` output.
+#[derive(Clone)]
 pub struct JwtCredentials {
     pub token: String,
+}
+
+impl std::fmt::Debug for JwtCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JwtCredentials")
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PasswordVerifier;
 
     #[test]
     fn test_local_credentials() {
@@ -238,7 +299,7 @@ mod tests {
         use crate::UserContext;
         use armature_jwt::JwtConfig;
 
-        let config = JwtConfig::new("test-secret".to_string());
+        let config = JwtConfig::new(crate::test_support::TEST_JWT_SECRET.to_string()).unwrap();
         let jwt_manager = JwtManager::new(config).unwrap();
         let strategy = JwtStrategy::<UserContext>::new(jwt_manager);
 
@@ -321,7 +382,10 @@ mod tests {
     async fn jwt_strategy_authenticates_valid_token() {
         use armature_jwt::JwtConfig;
 
-        let manager = JwtManager::new(JwtConfig::new("test-secret".to_string())).unwrap();
+        let manager = JwtManager::new(
+            JwtConfig::new(crate::test_support::TEST_JWT_SECRET.to_string()).unwrap(),
+        )
+        .unwrap();
         let exp = chrono::Utc::now().timestamp() + 3600;
         let token = manager
             .sign(&serde_json::json!({ "sub": "user123", "roles": ["admin"], "exp": exp }))
@@ -339,7 +403,10 @@ mod tests {
     async fn jwt_strategy_rejects_invalid_token() {
         use armature_jwt::JwtConfig;
 
-        let manager = JwtManager::new(JwtConfig::new("test-secret".to_string())).unwrap();
+        let manager = JwtManager::new(
+            JwtConfig::new(crate::test_support::TEST_JWT_SECRET.to_string()).unwrap(),
+        )
+        .unwrap();
         let strategy = JwtStrategy::<UserContext>::new(manager);
         let creds = JwtCredentials {
             token: "not.a.valid.token".to_string(),
@@ -347,5 +414,98 @@ mod tests {
 
         let result = strategy.authenticate(&creds).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn jwt_strategy_rejects_refresh_token() {
+        use armature_jwt::JwtConfig;
+
+        let manager = JwtManager::new(
+            JwtConfig::new(crate::test_support::TEST_JWT_SECRET.to_string()).unwrap(),
+        )
+        .unwrap();
+        let pair = manager
+            .generate_token_pair(&serde_json::json!({ "sub": "user123", "roles": ["admin"] }))
+            .unwrap();
+        let strategy = JwtStrategy::<UserContext>::new(manager);
+
+        let access = JwtCredentials {
+            token: pair.access_token,
+        };
+        assert!(strategy.authenticate(&access).await.is_ok());
+
+        let refresh = JwtCredentials {
+            token: pair.refresh_token,
+        };
+        assert!(strategy.authenticate(&refresh).await.is_err());
+    }
+
+    #[test]
+    fn credentials_redact_secrets() {
+        let creds = LocalCredentials {
+            username: "alice".to_string(),
+            password: "hunter2-secret".to_string(),
+        };
+        let debug = format!("{creds:?}");
+        assert!(!debug.contains("hunter2-secret"), "{debug}");
+        assert!(debug.contains("alice"));
+        let json = serde_json::to_string(&creds).unwrap();
+        assert!(!json.contains("hunter2-secret"), "{json}");
+
+        let parsed: LocalCredentials =
+            serde_json::from_str(r#"{"username":"a","password":"p"}"#).unwrap();
+        assert_eq!(parsed.password, "p");
+
+        let jwt = JwtCredentials {
+            token: "eyJ.secret.token".to_string(),
+        };
+        assert!(!format!("{jwt:?}").contains("eyJ.secret.token"));
+    }
+
+    struct RehashStore {
+        hash: String,
+        updated: std::sync::Mutex<Option<String>>,
+    }
+
+    #[async_trait]
+    impl LocalUserStore<UserContext> for RehashStore {
+        async fn find_by_username(&self, username: &str) -> Result<Option<(UserContext, String)>> {
+            Ok(Some((
+                UserContext::new(username.to_string()),
+                self.hash.clone(),
+            )))
+        }
+
+        async fn update_password_hash(&self, _username: &str, new_hash: &str) -> Result<()> {
+            *self.updated.lock().unwrap() = Some(new_hash.to_string());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn local_strategy_rehashes_legacy_hash_on_login() {
+        let legacy = PasswordHasher::new(crate::password::HashAlgorithm::Bcrypt)
+            .with_bcrypt_cost(4)
+            .unwrap()
+            .hash("correct-password")
+            .unwrap();
+        let store = Arc::new(RehashStore {
+            hash: legacy,
+            updated: std::sync::Mutex::new(None),
+        });
+        let strategy = LocalStrategy::<UserContext>::with_store(store.clone());
+        let creds = LocalCredentials {
+            username: "alice".to_string(),
+            password: "correct-password".to_string(),
+        };
+        strategy.authenticate(&creds).await.unwrap();
+
+        let new_hash = store.updated.lock().unwrap().clone().expect("rehashed");
+        assert!(new_hash.starts_with("$argon2id$"));
+        assert!(
+            PasswordHasher::default()
+                .verify("correct-password", &new_hash)
+                .unwrap()
+        );
     }
 }

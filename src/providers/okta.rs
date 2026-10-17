@@ -2,14 +2,13 @@
 
 use crate::Result;
 use crate::oauth2::{
-    GenericOAuth2Provider, OAuth2Config, OAuth2Provider, OAuth2Token, OAuth2UserInfo,
+    GenericOAuth2Provider, OAuth2Config, OAuth2Provider, OAuth2Token, OAuth2UserInfo, PendingAuth,
 };
 use async_trait::async_trait;
-use oauth2::CsrfToken;
 use url::Url;
 
 /// Okta provider configuration
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OktaConfig {
     pub client_id: String,
     pub client_secret: String,
@@ -17,6 +16,13 @@ pub struct OktaConfig {
     pub domain: String, // e.g., "dev-12345.okta.com" or "mycompany.okta.com"
     pub scopes: Vec<String>,
 }
+
+crate::providers::debug_redacting_client_secret!(OktaConfig {
+    client_id,
+    redirect_url,
+    domain,
+    scopes
+});
 
 impl OktaConfig {
     pub fn new(
@@ -50,7 +56,13 @@ pub struct OktaProvider {
 }
 
 impl OktaProvider {
+    /// # Errors
+    ///
+    /// [`crate::AuthError::Configuration`] if `domain` is not a bare hostname.
     pub fn new(config: OktaConfig) -> Result<Self> {
+        crate::providers::validate_hostname("Okta domain", &config.domain)?;
+        let issuer = format!("https://{}", config.domain);
+        let jwks_uri = format!("https://{}/oauth2/v1/keys", config.domain);
         let auth_url = format!("https://{}/oauth2/v1/authorize", config.domain);
         let token_url = format!("https://{}/oauth2/v1/token", config.domain);
         let user_info_url = format!("https://{}/oauth2/v1/userinfo", config.domain);
@@ -63,7 +75,8 @@ impl OktaProvider {
             config.redirect_url,
         )
         .with_scopes(config.scopes)
-        .with_user_info_url(user_info_url);
+        .with_user_info_url(user_info_url)
+        .with_oidc(issuer, jwks_uri);
 
         let inner = GenericOAuth2Provider::new("okta".to_string(), oauth2_config)?;
 
@@ -77,12 +90,19 @@ impl OAuth2Provider for OktaProvider {
         self.inner.name()
     }
 
-    fn authorization_url(&self) -> Result<(Url, CsrfToken)> {
+    fn authorization_url(&self) -> Result<(Url, PendingAuth)> {
         self.inner.authorization_url()
     }
 
-    async fn exchange_code(&self, code: String) -> Result<OAuth2Token> {
-        self.inner.exchange_code(code).await
+    async fn exchange_code(
+        &self,
+        code: String,
+        returned_state: &str,
+        pending: PendingAuth,
+    ) -> Result<OAuth2Token> {
+        self.inner
+            .exchange_code(code, returned_state, pending)
+            .await
     }
 
     async fn get_user_info(&self, token: &OAuth2Token) -> Result<OAuth2UserInfo> {
@@ -109,5 +129,29 @@ mod tests {
 
         assert_eq!(config.domain, "dev-12345.okta.com");
         assert_eq!(config.scopes.len(), 3);
+    }
+
+    #[test]
+    fn rejects_non_hostname_domain() {
+        for bad in ["evil.com/x", "a@b", "https://x", "x.com:443"] {
+            let config = OktaConfig::new(
+                "client_id".to_string(),
+                "client_secret".to_string(),
+                "http://localhost:3000/callback".to_string(),
+                bad.to_string(),
+            );
+            assert!(OktaProvider::new(config).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn debug_redacts_client_secret() {
+        let config = OktaConfig::new(
+            "client_id".to_string(),
+            "very-secret".to_string(),
+            "http://localhost:3000/callback".to_string(),
+            "dev-1.okta.com".to_string(),
+        );
+        assert!(!format!("{config:?}").contains("very-secret"));
     }
 }

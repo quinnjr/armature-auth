@@ -1,24 +1,58 @@
 // Authentication guards
 
 use crate::{AuthError, AuthUser, Result, UserContext};
+use armature_core::guard::{Guard as CoreGuard, GuardContext};
 use armature_core::{HttpRequest, RequestRoles};
 use async_trait::async_trait;
 
 /// Guard trait for protecting routes
+///
+/// Every guard in this crate also implements [`armature_core::Guard`], so it
+/// can be registered with core routing directly. If both traits are in scope,
+/// disambiguate calls with `Guard::can_activate(&guard, &req)`.
 #[async_trait]
 pub trait Guard: Send + Sync {
     /// Check if the request can proceed
     async fn can_activate(&self, request: &HttpRequest) -> Result<bool>;
 }
 
-/// Authentication guard - ensures a request carries a bearer token.
+/// Map an armature-auth error onto the core error the router turns into a
+/// response: missing identity is `401`, everything else is `403`.
+fn to_core_error(err: AuthError) -> armature_core::Error {
+    match err {
+        AuthError::Unauthorized
+        | AuthError::InvalidToken(_)
+        | AuthError::TokenExpired
+        | AuthError::JwtError(_) => armature_core::Error::Unauthorized(err.to_string()),
+        other => armature_core::Error::Forbidden(other.to_string()),
+    }
+}
+
+/// Implement [`armature_core::Guard`] in terms of this crate's [`Guard`].
+macro_rules! impl_core_guard {
+    ($ty:ty) => {
+        #[async_trait]
+        impl CoreGuard for $ty {
+            async fn can_activate(
+                &self,
+                context: &GuardContext,
+            ) -> std::result::Result<bool, armature_core::Error> {
+                Guard::can_activate(self, &context.request)
+                    .await
+                    .map_err(to_core_error)
+            }
+        }
+    };
+}
+
+/// Authentication guard — requires a **verified** identity on the request.
 ///
-/// This guard only checks that an `Authorization: Bearer …` header is present;
-/// it does **not** verify the token itself. Token verification and identity
-/// extraction are the job of the shipped [`crate::JwtAuthMiddleware`], which
-/// must run *before* this guard so that verified [`UserContext`] /
-/// [`armature_core::RequestRoles`] extensions are available to the role- and
-/// permission-aware guards below.
+/// Passes only when a [`UserContext`] extension is present, i.e. an
+/// authentication layer has verified the caller's credential and attached the
+/// result — in practice [`crate::JwtAuthMiddleware`], which must run before
+/// this guard. The mere presence of an `Authorization` header proves nothing
+/// and is not consulted: a request carrying `Authorization: Bearer x` but no
+/// verified identity is rejected with [`AuthError::Unauthorized`].
 #[derive(Clone)]
 pub struct AuthGuard;
 
@@ -53,35 +87,22 @@ impl Default for AuthGuard {
 #[async_trait]
 impl Guard for AuthGuard {
     async fn can_activate(&self, request: &HttpRequest) -> Result<bool> {
-        // Check for Authorization header
-        let auth_header = request
-            .headers
-            .get("authorization")
-            .ok_or(AuthError::Unauthorized)?;
-
-        // Check for Bearer token
-        if !auth_header.starts_with("Bearer ") {
-            return Err(AuthError::InvalidToken(
-                "Invalid authorization format".to_string(),
-            ));
+        match request.extensions.get::<UserContext>() {
+            Some(_) => Ok(true),
+            None => Err(AuthError::Unauthorized),
         }
-
-        // Presence and shape of the credential is all this guard decides. The
-        // token's signature, expiry and claims are verified by
-        // [`crate::JwtAuthMiddleware`], which must be registered ahead of the
-        // guarded route; this guard deliberately does not re-verify it.
-        Ok(true)
     }
 }
 
+impl_core_guard!(AuthGuard);
+
 /// Role-based authorization guard.
 ///
-/// Requires a `Bearer` authorization header (via [`AuthGuard`]) plus verified
-/// role information attached to the request by an authentication layer that
-/// has already validated the caller's token. The intended layer is the
-/// shipped [`crate::JwtAuthMiddleware`]: register it ahead of the guarded
-/// route so it verifies the JWT and populates the extensions this guard reads.
-/// The guard looks for, in order:
+/// Requires verified role information attached to the request by an
+/// authentication layer that has already validated the caller's token. The
+/// intended layer is the shipped [`crate::JwtAuthMiddleware`]: register it
+/// ahead of the guarded route so it verifies the JWT and populates the
+/// extensions this guard reads. The guard looks for, in order:
 ///
 /// 1. A [`UserContext`] in [`HttpRequest::extensions`], as produced by
 ///    [`crate::JwtAuthMiddleware`] from the token's claims after signature
@@ -90,11 +111,10 @@ impl Guard for AuthGuard {
 ///    by `armature_core::RolesGuard`, also populated by
 ///    [`crate::JwtAuthMiddleware`]).
 ///
-/// The guard fails closed: when `required_roles` is non-empty and neither
-/// extension is present, the request is rejected — a bearer token alone is
-/// never sufficient to satisfy a role requirement. Without
-/// [`crate::JwtAuthMiddleware`] (or an equivalent that inserts these
-/// extensions) in front, role-protected routes deny every request.
+/// The guard fails closed: with neither extension present the request is
+/// rejected as unauthenticated, whatever headers it carries. An **empty**
+/// role list (`RoleGuard::any(vec![])`) means "any authenticated caller", not
+/// "anyone": it still requires a verified identity.
 #[derive(Clone)]
 pub struct RoleGuard {
     required_roles: Vec<String>,
@@ -145,19 +165,10 @@ impl RoleGuard {
 #[async_trait]
 impl Guard for RoleGuard {
     async fn can_activate(&self, request: &HttpRequest) -> Result<bool> {
-        // First check authentication
-        let auth_guard = AuthGuard::new();
-        auth_guard.can_activate(request).await?;
-
-        // No role requirement: any authenticated request may proceed.
-        if self.required_roles.is_empty() {
-            return Ok(true);
-        }
-
         // Prefer the richer UserContext attached by an authentication layer
         // after it verified the caller's token.
         if let Some(user) = request.extensions.get::<UserContext>() {
-            return if self.check_roles(user) {
+            return if self.required_roles.is_empty() || self.check_roles(user) {
                 Ok(true)
             } else {
                 Err(AuthError::Forbidden("Insufficient role".to_string()))
@@ -166,22 +177,26 @@ impl Guard for RoleGuard {
 
         // Fall back to armature-core's RequestRoles extension.
         if let Some(roles) = request.extensions.get::<RequestRoles>() {
-            return if self.check_role_list(roles) {
+            return if self.required_roles.is_empty() || self.check_role_list(roles) {
                 Ok(true)
             } else {
                 Err(AuthError::Forbidden("Insufficient role".to_string()))
             };
         }
 
-        // Fail closed: authenticated, but no verified roles were attached to
-        // the request, so a non-empty role requirement cannot be satisfied.
-        Err(AuthError::Forbidden(
-            "No verified roles associated with this request".to_string(),
-        ))
+        // Fail closed: no verified identity was attached to the request.
+        Err(AuthError::Unauthorized)
     }
 }
 
-/// Permission-based authorization guard
+impl_core_guard!(RoleGuard);
+
+/// Permission-based authorization guard.
+///
+/// Requires a verified [`UserContext`] (attached by
+/// [`crate::JwtAuthMiddleware`] or an equivalent layer). An **empty**
+/// permission list means "any authenticated caller": it still requires the
+/// verified identity.
 #[derive(Clone)]
 pub struct PermissionGuard {
     required_permissions: Vec<String>,
@@ -222,29 +237,23 @@ impl PermissionGuard {
 #[async_trait]
 impl Guard for PermissionGuard {
     async fn can_activate(&self, request: &HttpRequest) -> Result<bool> {
-        // First check authentication
-        let auth_guard = AuthGuard::new();
-        auth_guard.can_activate(request).await?;
-
-        // No permission requirement: any authenticated request may proceed.
-        if self.required_permissions.is_empty() {
-            return Ok(true);
-        }
-
         // Permissions are only carried by the richer UserContext that an
         // authentication layer attaches after verifying the caller's token.
         // Fail closed if it is absent.
-        let user = request.extensions.get::<UserContext>().ok_or_else(|| {
-            AuthError::Forbidden("No verified user associated with this request".to_string())
-        })?;
+        let user = request
+            .extensions
+            .get::<UserContext>()
+            .ok_or(AuthError::Unauthorized)?;
 
-        if self.check_permissions(user) {
+        if self.required_permissions.is_empty() || self.check_permissions(user) {
             Ok(true)
         } else {
             Err(AuthError::Forbidden("Insufficient permissions".to_string()))
         }
     }
 }
+
+impl_core_guard!(PermissionGuard);
 
 #[cfg(test)]
 mod tests {
@@ -293,7 +302,9 @@ mod tests {
         assert!(matches!(result, Err(AuthError::Unauthorized)));
     }
 
-    fn authenticated_request() -> HttpRequest {
+    /// A request carrying an (unverified) bearer header but no verified
+    /// identity — exactly what an attacker can send.
+    fn header_only_request() -> HttpRequest {
         let mut request = HttpRequest::new("GET", "/admin".to_string());
         request
             .headers
@@ -301,23 +312,53 @@ mod tests {
         request
     }
 
+    fn verified_request(user: UserContext) -> HttpRequest {
+        let mut request = HttpRequest::new("GET", "/admin".to_string());
+        request.extensions.insert(user);
+        request
+    }
+
+    #[tokio::test]
+    async fn auth_guard_rejects_bearer_header_without_verified_identity() {
+        let guard = AuthGuard::new();
+        assert!(matches!(
+            Guard::can_activate(&guard, &header_only_request()).await,
+            Err(AuthError::Unauthorized)
+        ));
+    }
+
+    #[tokio::test]
+    async fn auth_guard_accepts_verified_identity() {
+        let guard = AuthGuard::new();
+        let request = verified_request(UserContext::new("u".to_string()));
+        assert!(matches!(
+            Guard::can_activate(&guard, &request).await,
+            Ok(true)
+        ));
+    }
+
     #[tokio::test]
     async fn test_role_guard_matching_role_passes() {
         let guard = RoleGuard::any(vec!["admin".to_string()]);
 
         // Via UserContext extension
-        let mut request = authenticated_request();
-        request
-            .extensions
-            .insert(UserContext::new("user123".to_string()).with_roles(vec!["admin".to_string()]));
-        assert!(matches!(guard.can_activate(&request).await, Ok(true)));
+        let request = verified_request(
+            UserContext::new("user123".to_string()).with_roles(vec!["admin".to_string()]),
+        );
+        assert!(matches!(
+            Guard::can_activate(&guard, &request).await,
+            Ok(true)
+        ));
 
         // Via RequestRoles extension
-        let mut request = authenticated_request();
+        let mut request = HttpRequest::new("GET", "/admin".to_string());
         request
             .extensions
             .insert(RequestRoles::new(["user", "admin"]));
-        assert!(matches!(guard.can_activate(&request).await, Ok(true)));
+        assert!(matches!(
+            Guard::can_activate(&guard, &request).await,
+            Ok(true)
+        ));
     }
 
     #[tokio::test]
@@ -325,49 +366,68 @@ mod tests {
         let guard = RoleGuard::any(vec!["admin".to_string()]);
 
         // UserContext without the required role
-        let mut request = authenticated_request();
-        request
-            .extensions
-            .insert(UserContext::new("user123".to_string()).with_roles(vec!["user".to_string()]));
-        assert!(guard.can_activate(&request).await.is_err());
+        let request = verified_request(
+            UserContext::new("user123".to_string()).with_roles(vec!["user".to_string()]),
+        );
+        assert!(matches!(
+            Guard::can_activate(&guard, &request).await,
+            Err(AuthError::Forbidden(_))
+        ));
 
         // RequestRoles without the required role
-        let mut request = authenticated_request();
+        let mut request = HttpRequest::new("GET", "/admin".to_string());
         request.extensions.insert(RequestRoles::new(["user"]));
-        assert!(guard.can_activate(&request).await.is_err());
+        assert!(Guard::can_activate(&guard, &request).await.is_err());
     }
 
     #[tokio::test]
     async fn test_role_guard_require_all_via_request_roles() {
         let guard = RoleGuard::all(vec!["admin".to_string(), "user".to_string()]);
 
-        let mut request = authenticated_request();
+        let mut request = HttpRequest::new("GET", "/admin".to_string());
         request.extensions.insert(RequestRoles::new(["admin"]));
-        assert!(guard.can_activate(&request).await.is_err());
+        assert!(Guard::can_activate(&guard, &request).await.is_err());
 
-        let mut request = authenticated_request();
+        let mut request = HttpRequest::new("GET", "/admin".to_string());
         request
             .extensions
             .insert(RequestRoles::new(["admin", "user"]));
-        assert!(matches!(guard.can_activate(&request).await, Ok(true)));
+        assert!(matches!(
+            Guard::can_activate(&guard, &request).await,
+            Ok(true)
+        ));
     }
 
     #[tokio::test]
     async fn test_role_guard_no_roles_attached_denied() {
         let guard = RoleGuard::any(vec!["admin".to_string()]);
 
-        // Authenticated (bearer token present) but no roles attached:
-        // must fail closed.
-        let request = authenticated_request();
-        assert!(guard.can_activate(&request).await.is_err());
+        // Bearer header present but no verified identity: must fail closed.
+        assert!(matches!(
+            Guard::can_activate(&guard, &header_only_request()).await,
+            Err(AuthError::Unauthorized)
+        ));
     }
 
     #[tokio::test]
-    async fn test_role_guard_empty_required_roles_allows_authenticated() {
+    async fn empty_role_requirement_still_requires_authentication() {
         let guard = RoleGuard::any(vec![]);
 
-        let request = authenticated_request();
-        assert!(matches!(guard.can_activate(&request).await, Ok(true)));
+        // Header only: not authenticated.
+        assert!(matches!(
+            Guard::can_activate(&guard, &header_only_request()).await,
+            Err(AuthError::Unauthorized)
+        ));
+        // No header at all.
+        let request = HttpRequest::new("GET", "/admin".to_string());
+        assert!(Guard::can_activate(&guard, &request).await.is_err());
+
+        // Verified identity with no roles: allowed.
+        let request = verified_request(UserContext::new("u".to_string()));
+        assert!(matches!(
+            Guard::can_activate(&guard, &request).await,
+            Ok(true)
+        ));
     }
 
     #[tokio::test]
@@ -375,7 +435,7 @@ mod tests {
         let guard = RoleGuard::any(vec!["admin".to_string()]);
 
         let request = HttpRequest::new("GET", "/admin".to_string());
-        assert!(guard.can_activate(&request).await.is_err());
+        assert!(Guard::can_activate(&guard, &request).await.is_err());
     }
 
     #[test]
@@ -401,36 +461,71 @@ mod tests {
     #[tokio::test]
     async fn test_permission_guard_matching_permission_passes() {
         let guard = PermissionGuard::any(vec!["write".to_string()]);
-        let mut request = authenticated_request();
-        request.extensions.insert(
+        let request = verified_request(
             UserContext::new("user123".to_string())
                 .with_permissions(vec!["read".to_string(), "write".to_string()]),
         );
-        assert!(matches!(guard.can_activate(&request).await, Ok(true)));
+        assert!(matches!(
+            Guard::can_activate(&guard, &request).await,
+            Ok(true)
+        ));
     }
 
     #[tokio::test]
     async fn test_permission_guard_missing_permission_denied() {
         let guard = PermissionGuard::any(vec!["delete".to_string()]);
-        let mut request = authenticated_request();
-        request.extensions.insert(
+        let request = verified_request(
             UserContext::new("user123".to_string()).with_permissions(vec!["read".to_string()]),
         );
-        assert!(guard.can_activate(&request).await.is_err());
+        assert!(Guard::can_activate(&guard, &request).await.is_err());
     }
 
     #[tokio::test]
     async fn test_permission_guard_no_user_attached_denied() {
         let guard = PermissionGuard::any(vec!["read".to_string()]);
-        // Authenticated but no UserContext attached: must fail closed.
-        let request = authenticated_request();
-        assert!(guard.can_activate(&request).await.is_err());
+        // Bearer header but no UserContext attached: must fail closed.
+        assert!(
+            Guard::can_activate(&guard, &header_only_request())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
-    async fn test_permission_guard_empty_required_allows_authenticated() {
+    async fn empty_permission_requirement_still_requires_authentication() {
         let guard = PermissionGuard::any(vec![]);
-        let request = authenticated_request();
-        assert!(matches!(guard.can_activate(&request).await, Ok(true)));
+        assert!(matches!(
+            Guard::can_activate(&guard, &header_only_request()).await,
+            Err(AuthError::Unauthorized)
+        ));
+        let request = verified_request(UserContext::new("u".to_string()));
+        assert!(matches!(
+            Guard::can_activate(&guard, &request).await,
+            Ok(true)
+        ));
+    }
+
+    #[tokio::test]
+    async fn guards_plug_into_core_guard_trait() {
+        use armature_core::Error as CoreError;
+
+        // Header only -> 401 via core error mapping.
+        let ctx = GuardContext::new(header_only_request());
+        let res = CoreGuard::can_activate(&AuthGuard::new(), &ctx).await;
+        assert!(matches!(res, Err(CoreError::Unauthorized(_))), "{res:?}");
+
+        // Verified but wrong role -> 403.
+        let ctx = GuardContext::new(verified_request(
+            UserContext::new("u".to_string()).with_roles(vec!["user".to_string()]),
+        ));
+        let res = CoreGuard::can_activate(&RoleGuard::any(vec!["admin".to_string()]), &ctx).await;
+        assert!(matches!(res, Err(CoreError::Forbidden(_))), "{res:?}");
+
+        // Verified with the permission -> allowed, usable as a trait object.
+        let ctx = GuardContext::new(verified_request(
+            UserContext::new("u".to_string()).with_permissions(vec!["read".to_string()]),
+        ));
+        let guard: Box<dyn CoreGuard> = Box::new(PermissionGuard::any(vec!["read".to_string()]));
+        assert!(matches!(guard.can_activate(&ctx).await, Ok(true)));
     }
 }

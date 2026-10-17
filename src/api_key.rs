@@ -4,7 +4,11 @@
 //!
 //! # Features
 //!
-//! - API key generation with secure random
+//! - API key generation with secure random (256-bit)
+//! - Keys are never stored: the store only ever sees
+//!   `HMAC-SHA256(pepper, key)` ([`ApiKey::key_hash`]). The plaintext is
+//!   returned exactly once, in the [`GeneratedApiKey`] from
+//!   [`ApiKeyManager::generate`], for you to hand to the client.
 //! - Key validation and verification
 //! - Key rotation and expiration
 //! - Rate limiting per key
@@ -25,23 +29,25 @@
 //! #[async_trait::async_trait]
 //! impl ApiKeyStore for MyApiKeyStore {
 //!     async fn save(&self, key: &ApiKey) -> Result<(), ApiKeyError> { Ok(()) }
-//!     async fn find_by_key(&self, key: &str) -> Result<Option<ApiKey>, ApiKeyError> { Ok(None) }
+//!     async fn find_by_key_hash(&self, key_hash: &str) -> Result<Option<ApiKey>, ApiKeyError> { Ok(None) }
 //!     async fn find_by_id(&self, id: &str) -> Result<Option<ApiKey>, ApiKeyError> { Ok(None) }
 //!     async fn list_by_user(&self, user_id: &str) -> Result<Vec<ApiKey>, ApiKeyError> { Ok(vec![]) }
 //!     async fn revoke(&self, key_id: &str) -> Result<(), ApiKeyError> { Ok(()) }
 //!     async fn update_last_used(&self, key_id: &str, timestamp: DateTime<Utc>) -> Result<(), ApiKeyError> { Ok(()) }
 //! }
 //!
-//! // Inject store via DI container
+//! // Inject store via DI container. The pepper is a server-side secret
+//! // (>= 32 bytes) kept outside the database, e.g. in a secret manager.
 //! let store: Arc<dyn ApiKeyStore> = Arc::new(MyApiKeyStore);
-//! let manager = ApiKeyManager::new(store);
+//! let pepper = std::env::var("API_KEY_PEPPER")?;
+//! let manager = ApiKeyManager::new(store, pepper.into_bytes())?;
 //!
-//! // Generate API key
-//! let api_key = manager.generate("user_123", vec!["read".to_string(), "write".to_string()]).await?;
-//! println!("API Key: {}", api_key.key);
+//! // Generate API key: the plaintext is available only here.
+//! let generated = manager.generate("user_123", vec!["read".to_string(), "write".to_string()]).await?;
+//! let plaintext = generated.secret().to_string(); // show to the user once
 //!
 //! // Validate API key
-//! if let Some(key) = manager.validate(&api_key.key).await? {
+//! if let Some(key) = manager.validate(&plaintext).await? {
 //!     println!("Valid key for user: {}", key.user_id);
 //! }
 //! # Ok(())
@@ -52,11 +58,14 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Duration, Utc};
 use dashmap::DashMap;
+use hmac::{Hmac, KeyInit, Mac};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 /// API Key errors
@@ -79,21 +88,33 @@ pub enum ApiKeyError {
 
     #[error("Rate limit exceeded")]
     RateLimitExceeded,
+
+    #[error("API key configuration error: {0}")]
+    Configuration(String),
 }
+
+/// Minimum length of the [`ApiKeyManager`] pepper.
+pub const MIN_PEPPER_LEN: usize = 32;
 
 /// Below this many tracked keys the counter map is small enough that expired
 /// windows are not worth sweeping; above it, a sweep runs at most once per
 /// rate-limit window (see [`ApiKeyManager::check_rate_limit`]).
 const RATE_COUNTER_SWEEP_THRESHOLD: usize = 1024;
 
-/// API Key structure
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A stored API key record.
+///
+/// Holds no secret: the key itself is represented only by
+/// [`key_hash`](Self::key_hash), a keyed hash that cannot be reversed or
+/// brute-forced without the manager's pepper. This is what an
+/// [`ApiKeyStore`] persists.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ApiKey {
     /// Unique key ID
     pub id: String,
 
-    /// The actual API key (store hash, not plaintext!)
-    pub key: String,
+    /// Hex `HMAC-SHA256(pepper, key)` of the plaintext key; the store's
+    /// lookup index. See [`ApiKeyManager::hash_key`].
+    pub key_hash: String,
 
     /// User/account ID this key belongs to
     pub user_id: String,
@@ -120,16 +141,76 @@ pub struct ApiKey {
     pub rate_limit: Option<u32>,
 }
 
+impl fmt::Debug for ApiKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ApiKey")
+            .field("id", &self.id)
+            .field("key_hash", &"<redacted>")
+            .field("user_id", &self.user_id)
+            .field("name", &self.name)
+            .field("scopes", &self.scopes)
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .field("last_used_at", &self.last_used_at)
+            .field("revoked", &self.revoked)
+            .field("rate_limit", &self.rate_limit)
+            .finish()
+    }
+}
+
+/// A freshly generated API key: the stored [`ApiKey`] record plus the
+/// plaintext key, which exists only in this value.
+///
+/// Return [`secret`](Self::secret) to the client once; it cannot be recovered
+/// later. The plaintext is redacted from `Debug` and the type is not
+/// `Serialize`, so it cannot leak into logs or be persisted by accident.
+#[derive(Clone)]
+pub struct GeneratedApiKey {
+    /// The stored record (no secret material).
+    pub api_key: ApiKey,
+    plaintext: String,
+}
+
+impl GeneratedApiKey {
+    /// The plaintext API key, to hand to the client exactly once.
+    pub fn secret(&self) -> &str {
+        &self.plaintext
+    }
+
+    /// Consume this value, returning the plaintext key.
+    pub fn into_secret(self) -> String {
+        self.plaintext
+    }
+}
+
+impl fmt::Debug for GeneratedApiKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GeneratedApiKey")
+            .field("api_key", &self.api_key)
+            .field("plaintext", &"<redacted>")
+            .finish()
+    }
+}
+
+impl std::ops::Deref for GeneratedApiKey {
+    type Target = ApiKey;
+
+    fn deref(&self) -> &ApiKey {
+        &self.api_key
+    }
+}
+
 /// API Key storage trait (implement with your database)
 ///
 /// Users must provide their own implementation using their database of choice.
+/// The store never receives a plaintext key — only [`ApiKey::key_hash`].
 #[async_trait]
 pub trait ApiKeyStore: Send + Sync {
     /// Save or update an API key
     async fn save(&self, key: &ApiKey) -> Result<(), ApiKeyError>;
 
-    /// Find API key by the key string (should query by hash)
-    async fn find_by_key(&self, key: &str) -> Result<Option<ApiKey>, ApiKeyError>;
+    /// Find an API key by its [`ApiKey::key_hash`] (an exact, indexed match).
+    async fn find_by_key_hash(&self, key_hash: &str) -> Result<Option<ApiKey>, ApiKeyError>;
 
     /// Find API key by ID
     async fn find_by_id(&self, id: &str) -> Result<Option<ApiKey>, ApiKeyError>;
@@ -153,6 +234,8 @@ pub trait ApiKeyStore: Send + Sync {
 /// Manages API key lifecycle with injected storage.
 pub struct ApiKeyManager {
     store: Arc<dyn ApiKeyStore>,
+    /// Server-side secret keying the stored key hashes.
+    pepper: Vec<u8>,
     key_prefix: String,
     default_expiration: Option<Duration>,
     /// Rolling window used to enforce each key's `rate_limit` (requests per
@@ -187,24 +270,43 @@ impl ApiKeyManager {
     /// # #[async_trait::async_trait]
     /// # impl ApiKeyStore for MyStore {
     /// #     async fn save(&self, key: &ApiKey) -> Result<(), ApiKeyError> { Ok(()) }
-    /// #     async fn find_by_key(&self, key: &str) -> Result<Option<ApiKey>, ApiKeyError> { Ok(None) }
+    /// #     async fn find_by_key_hash(&self, key_hash: &str) -> Result<Option<ApiKey>, ApiKeyError> { Ok(None) }
     /// #     async fn find_by_id(&self, id: &str) -> Result<Option<ApiKey>, ApiKeyError> { Ok(None) }
     /// #     async fn list_by_user(&self, user_id: &str) -> Result<Vec<ApiKey>, ApiKeyError> { Ok(vec![]) }
     /// #     async fn revoke(&self, key_id: &str) -> Result<(), ApiKeyError> { Ok(()) }
     /// #     async fn update_last_used(&self, key_id: &str, timestamp: DateTime<Utc>) -> Result<(), ApiKeyError> { Ok(()) }
     /// # }
     /// let store: Arc<dyn ApiKeyStore> = Arc::new(MyStore);
-    /// let manager = ApiKeyManager::new(store);
+    /// let pepper = std::env::var("API_KEY_PEPPER").unwrap().into_bytes();
+    /// let manager = ApiKeyManager::new(store, pepper).unwrap();
     /// ```
-    pub fn new(store: Arc<dyn ApiKeyStore>) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// [`ApiKeyError::Configuration`] if `pepper` is shorter than
+    /// [`MIN_PEPPER_LEN`] bytes. The pepper must be a random server-side
+    /// secret stored apart from the key database; rotating it invalidates
+    /// every issued key.
+    pub fn new(
+        store: Arc<dyn ApiKeyStore>,
+        pepper: impl Into<Vec<u8>>,
+    ) -> Result<Self, ApiKeyError> {
+        let pepper = pepper.into();
+        if pepper.len() < MIN_PEPPER_LEN {
+            return Err(ApiKeyError::Configuration(format!(
+                "API key pepper must be at least {MIN_PEPPER_LEN} bytes (got {})",
+                pepper.len()
+            )));
+        }
+        Ok(Self {
             store,
+            pepper,
             key_prefix: "ak".to_string(),
             default_expiration: Some(Duration::days(365)),
             rate_limit_window: Duration::minutes(1),
             rate_counters: DashMap::new(),
             last_sweep_unix: AtomicI64::new(0),
-        }
+        })
     }
 
     /// Set key prefix (default: "ak")
@@ -321,7 +423,7 @@ impl ApiKeyManager {
     ///     vec!["read".to_string(), "write".to_string()]
     /// ).await?;
     ///
-    /// println!("API Key: {}", key.key);
+    /// let plaintext = key.secret(); // return to the client once
     /// println!("Key ID: {}", key.id);
     /// # Ok(())
     /// # }
@@ -330,7 +432,7 @@ impl ApiKeyManager {
         &self,
         user_id: impl Into<String>,
         scopes: Vec<String>,
-    ) -> Result<ApiKey, ApiKeyError> {
+    ) -> Result<GeneratedApiKey, ApiKeyError> {
         let key_id = uuid::Uuid::new_v4().to_string();
         let raw_key = self.generate_random_key();
         let key_string = format!("{}_{}", self.key_prefix, raw_key);
@@ -339,7 +441,7 @@ impl ApiKeyManager {
 
         let api_key = ApiKey {
             id: key_id,
-            key: key_string.clone(),
+            key_hash: self.hash_key(&key_string),
             user_id: user_id.into(),
             name: None,
             scopes,
@@ -350,20 +452,31 @@ impl ApiKeyManager {
             rate_limit: None,
         };
 
-        // Store key (implementation should hash the key!)
+        // Only the keyed hash reaches the store.
         self.store.save(&api_key).await?;
 
-        Ok(api_key)
+        Ok(GeneratedApiKey {
+            api_key,
+            plaintext: key_string,
+        })
     }
 
     /// Validate an API key
     ///
     /// Returns the API key if valid, None if invalid, or an error.
     pub async fn validate(&self, key: &str) -> Result<Option<ApiKey>, ApiKeyError> {
-        let api_key = match self.store.find_by_key(key).await? {
+        let key_hash = self.hash_key(key);
+        let api_key = match self.store.find_by_key_hash(&key_hash).await? {
             Some(k) => k,
             None => return Ok(None),
         };
+
+        // Re-check the match in constant time rather than trusting the
+        // store's lookup semantics (collation, prefix or case-insensitive
+        // matching in some databases).
+        if !bool::from(api_key.key_hash.as_bytes().ct_eq(key_hash.as_bytes())) {
+            return Ok(None);
+        }
 
         // Check if revoked
         if api_key.revoked {
@@ -407,7 +520,7 @@ impl ApiKeyManager {
     }
 
     /// Rotate an API key (revoke old, generate new)
-    pub async fn rotate(&self, old_key_id: &str) -> Result<ApiKey, ApiKeyError> {
+    pub async fn rotate(&self, old_key_id: &str) -> Result<GeneratedApiKey, ApiKeyError> {
         // Get old key
         let old_key = self
             .store
@@ -429,11 +542,15 @@ impl ApiKeyManager {
         URL_SAFE_NO_PAD.encode(bytes)
     }
 
-    /// Hash an API key (for storage)
-    pub fn hash_key(key: &str) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(key.as_bytes());
-        hex::encode(hasher.finalize())
+    /// The stored form of an API key: hex `HMAC-SHA256(pepper, key)`.
+    ///
+    /// Keyed so that a leaked key table cannot be used to check guesses
+    /// offline without also stealing the pepper.
+    pub fn hash_key(&self, key: &str) -> String {
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&self.pepper)
+            .expect("HMAC accepts any key length");
+        mac.update(key.as_bytes());
+        hex::encode(mac.finalize().into_bytes())
     }
 }
 
@@ -453,6 +570,12 @@ mod tests {
         }
     }
 
+    const PEPPER: &[u8] = b"test-pepper-0123456789abcdefghijklmnop";
+
+    fn manager_with(store: Arc<InMemoryStore>) -> ApiKeyManager {
+        ApiKeyManager::new(store, PEPPER).unwrap()
+    }
+
     #[async_trait]
     impl ApiKeyStore for InMemoryStore {
         async fn save(&self, key: &ApiKey) -> Result<(), ApiKeyError> {
@@ -465,9 +588,9 @@ mod tests {
             Ok(())
         }
 
-        async fn find_by_key(&self, key: &str) -> Result<Option<ApiKey>, ApiKeyError> {
+        async fn find_by_key_hash(&self, key_hash: &str) -> Result<Option<ApiKey>, ApiKeyError> {
             let keys = self.keys.lock().unwrap();
-            Ok(keys.iter().find(|k| k.key == key).cloned())
+            Ok(keys.iter().find(|k| k.key_hash == key_hash).cloned())
         }
 
         async fn find_by_id(&self, id: &str) -> Result<Option<ApiKey>, ApiKeyError> {
@@ -508,14 +631,14 @@ mod tests {
     #[tokio::test]
     async fn test_generate_api_key() {
         let store = Arc::new(InMemoryStore::new());
-        let manager = ApiKeyManager::new(store);
+        let manager = manager_with(store);
 
         let key = manager
             .generate("user_123", vec!["read".to_string()])
             .await
             .unwrap();
 
-        assert!(key.key.starts_with("ak_"));
+        assert!(key.secret().starts_with("ak_"));
         assert_eq!(key.user_id, "user_123");
         assert_eq!(key.scopes, vec!["read"]);
     }
@@ -523,13 +646,13 @@ mod tests {
     #[tokio::test]
     async fn test_validate_api_key() {
         let store = Arc::new(InMemoryStore::new());
-        let manager = ApiKeyManager::new(store);
+        let manager = manager_with(store);
 
         let key = manager
             .generate("user_123", vec!["read".to_string()])
             .await
             .unwrap();
-        let validated = manager.validate(&key.key).await.unwrap();
+        let validated = manager.validate(key.secret()).await.unwrap();
 
         assert!(validated.is_some());
         assert_eq!(validated.unwrap().user_id, "user_123");
@@ -538,30 +661,30 @@ mod tests {
     #[tokio::test]
     async fn validate_enforces_rate_limit_per_key() {
         let store = Arc::new(InMemoryStore::new());
-        let manager = ApiKeyManager::new(store.clone());
+        let manager = ApiKeyManager::new(store.clone(), PEPPER).unwrap();
 
         let mut key = manager
             .generate("user_123", vec!["read".to_string()])
             .await
             .unwrap();
-        key.rate_limit = Some(3);
-        store.save(&key).await.unwrap();
+        key.api_key.rate_limit = Some(3);
+        store.save(&key.api_key).await.unwrap();
 
         // First 3 calls (the limit) succeed.
         for _ in 0..3 {
-            let result = manager.validate(&key.key).await;
+            let result = manager.validate(key.secret()).await;
             assert!(result.is_ok(), "expected call within limit to succeed");
         }
 
         // The 4th call within the same window is rejected.
-        let result = manager.validate(&key.key).await;
+        let result = manager.validate(key.secret()).await;
         assert!(matches!(result, Err(ApiKeyError::RateLimitExceeded)));
     }
 
     #[tokio::test]
     async fn validate_without_rate_limit_is_unbounded() {
         let store = Arc::new(InMemoryStore::new());
-        let manager = ApiKeyManager::new(store);
+        let manager = manager_with(store);
 
         let key = manager
             .generate("user_123", vec!["read".to_string()])
@@ -569,14 +692,14 @@ mod tests {
             .unwrap();
 
         for _ in 0..10 {
-            assert!(manager.validate(&key.key).await.unwrap().is_some());
+            assert!(manager.validate(key.secret()).await.unwrap().is_some());
         }
     }
 
     #[tokio::test]
     async fn test_revoke_api_key() {
         let store = Arc::new(InMemoryStore::new());
-        let manager = ApiKeyManager::new(store);
+        let manager = manager_with(store);
 
         let key = manager
             .generate("user_123", vec!["read".to_string()])
@@ -584,7 +707,7 @@ mod tests {
             .unwrap();
         manager.revoke(&key.id).await.unwrap();
 
-        let result = manager.validate(&key.key).await;
+        let result = manager.validate(key.secret()).await;
         assert!(matches!(result, Err(ApiKeyError::Revoked)));
     }
 
@@ -596,29 +719,30 @@ mod tests {
         // `start_paused` + `tokio::time::advance` to fake elapsed time. Use a
         // generously wide window/sleep margin instead of a tight one to keep
         // this timing-based test from flaking under load.
-        let manager =
-            ApiKeyManager::new(store.clone()).with_rate_limit_window(Duration::milliseconds(200));
+        let manager = ApiKeyManager::new(store.clone(), PEPPER)
+            .unwrap()
+            .with_rate_limit_window(Duration::milliseconds(200));
 
         let mut key = manager
             .generate("user_123", vec!["read".to_string()])
             .await
             .unwrap();
-        key.rate_limit = Some(2);
-        store.save(&key).await.unwrap();
+        key.api_key.rate_limit = Some(2);
+        store.save(&key.api_key).await.unwrap();
 
         // First 2 calls (the limit) succeed.
         for _ in 0..2 {
-            let result = manager.validate(&key.key).await;
+            let result = manager.validate(key.secret()).await;
             assert!(result.is_ok(), "expected call within limit to succeed");
         }
 
         // The 3rd call within the same window is rejected.
-        let result = manager.validate(&key.key).await;
+        let result = manager.validate(key.secret()).await;
         assert!(matches!(result, Err(ApiKeyError::RateLimitExceeded)));
 
         // Wait past the window and confirm the count resets.
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        let result = manager.validate(&key.key).await;
+        let result = manager.validate(key.secret()).await;
         assert!(
             result.is_ok(),
             "expected count to reset after window elapsed"
@@ -628,7 +752,7 @@ mod tests {
     #[tokio::test]
     async fn rotate_revokes_old_key_and_preserves_scopes() {
         let store = Arc::new(InMemoryStore::new());
-        let manager = ApiKeyManager::new(store);
+        let manager = manager_with(store);
 
         let old_key = manager
             .generate("user_123", vec!["read".to_string(), "write".to_string()])
@@ -638,11 +762,11 @@ mod tests {
         let new_key = manager.rotate(&old_key.id).await.unwrap();
 
         // Old key is now revoked.
-        let old_result = manager.validate(&old_key.key).await;
+        let old_result = manager.validate(old_key.secret()).await;
         assert!(matches!(old_result, Err(ApiKeyError::Revoked)));
 
         // New key validates and carries the same scopes.
-        let validated = manager.validate(&new_key.key).await.unwrap();
+        let validated = manager.validate(new_key.secret()).await.unwrap();
         assert!(validated.is_some());
         let validated = validated.unwrap();
         assert_eq!(validated.scopes, old_key.scopes);
@@ -653,7 +777,7 @@ mod tests {
     #[tokio::test]
     async fn test_has_scope() {
         let store = Arc::new(InMemoryStore::new());
-        let manager = ApiKeyManager::new(store);
+        let manager = manager_with(store);
 
         let key = manager
             .generate("user_123", vec!["read".to_string(), "write".to_string()])
@@ -663,5 +787,65 @@ mod tests {
         assert!(manager.has_scope(&key, "read"));
         assert!(manager.has_scope(&key, "write"));
         assert!(!manager.has_scope(&key, "admin"));
+    }
+
+    #[tokio::test]
+    async fn store_never_sees_plaintext_key() {
+        let store = Arc::new(InMemoryStore::new());
+        let manager = manager_with(store.clone());
+        let generated = manager.generate("user_123", vec![]).await.unwrap();
+
+        let stored = store.keys.lock().unwrap()[0].clone();
+        let serialized = serde_json::to_string(&stored).unwrap();
+        assert!(!serialized.contains(generated.secret()), "{serialized}");
+        assert_ne!(stored.key_hash, generated.secret());
+        assert_eq!(stored.key_hash, manager.hash_key(generated.secret()));
+    }
+
+    #[tokio::test]
+    async fn key_hash_depends_on_pepper() {
+        let store = Arc::new(InMemoryStore::new());
+        let a = manager_with(store.clone());
+        let b = ApiKeyManager::new(
+            store.clone(),
+            b"another-pepper-0123456789abcdefghijk".to_vec(),
+        )
+        .unwrap();
+        assert_ne!(a.hash_key("ak_x"), b.hash_key("ak_x"));
+
+        // A key issued under one pepper does not validate under another.
+        let generated = a.generate("u", vec![]).await.unwrap();
+        assert!(b.validate(generated.secret()).await.unwrap().is_none());
+        assert!(a.validate(generated.secret()).await.unwrap().is_some());
+    }
+
+    #[test]
+    fn short_pepper_rejected() {
+        let store = Arc::new(InMemoryStore::new());
+        assert!(matches!(
+            ApiKeyManager::new(store, b"short".to_vec()),
+            Err(ApiKeyError::Configuration(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn wrong_key_does_not_validate() {
+        let store = Arc::new(InMemoryStore::new());
+        let manager = manager_with(store);
+        let generated = manager.generate("u", vec![]).await.unwrap();
+        let mut wrong = generated.secret().to_string();
+        wrong.push('x');
+        assert!(manager.validate(&wrong).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn debug_redacts_key_material() {
+        let store = Arc::new(InMemoryStore::new());
+        let manager = manager_with(store);
+        let generated = manager.generate("u", vec![]).await.unwrap();
+        let debug = format!("{generated:?}");
+        assert!(!debug.contains(generated.secret()), "{debug}");
+        assert!(!debug.contains(&generated.key_hash), "{debug}");
+        assert!(debug.contains("<redacted>"));
     }
 }
