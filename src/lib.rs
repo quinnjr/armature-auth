@@ -49,8 +49,9 @@
 //! use armature_jwt::{JwtConfig, JwtManager};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! // Create JWT manager
-//! let jwt_config = JwtConfig::new("your-secret-key".to_string());
+//! // Create JWT manager. The HMAC secret must be >= 32 random bytes; weak or
+//! // placeholder secrets are rejected.
+//! let jwt_config = JwtConfig::new(std::env::var("JWT_SECRET")?)?;
 //! let jwt_manager = JwtManager::new(jwt_config)?;
 //!
 //! // Create auth service with JWT
@@ -77,19 +78,28 @@
 //!
 //! let provider = GoogleProvider::new(config)?;
 //!
-//! // Generate authorization URL
-//! let (auth_url, state) = provider.authorization_url()?;
+//! // Generate the authorization URL (PKCE S256 + state + OIDC nonce). Keep
+//! // `pending` in the server-side session until the callback.
+//! let (auth_url, pending) = provider.authorization_url()?;
 //! println!("Redirect user to: {}", auth_url);
-//! println!("State: {}", state.secret());
 //!
-//! // After callback, exchange code for token
-//! let token = provider.exchange_code("auth-code".to_string()).await?;
-//! println!("Access token: {}", token.access_token);
+//! // On the callback: pass the returned `code` and `state` with the stored
+//! // `pending`. State is checked in constant time and the id_token verified.
+//! # let (code, returned_state) = ("auth-code".to_string(), pending.state().to_string());
+//! let token = provider.exchange_code(code, &returned_state, pending).await?;
+//! let user = provider.get_user_info(&token).await?;
+//! println!("Signed in: {}", user.sub);
 //! # Ok(())
 //! # }
 //! ```
 //!
 //! ## Route Guards
+//!
+//! The guards require a **verified** identity attached by
+//! [`JwtAuthMiddleware`] (register it with `Application::use_middleware`,
+//! which runs before guards); a bare
+//! `Authorization` header is never enough. They implement both this crate's
+//! [`Guard`] and [`armature_core::Guard`].
 //!
 //! ```ignore
 //! use armature_auth::{AuthGuard, RoleGuard};
@@ -122,24 +132,30 @@
 //!
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let config = SamlConfig {
-//!     entity_id: "https://myapp.com".to_string(),
-//!     acs_url: "https://myapp.com/callback".to_string(),
-//!     sls_url: None,
+//! let config = SamlConfig::new(
+//!     "https://myapp.com".to_string(),
+//!     "https://myapp.com/callback".to_string(),
 //!     // IdP metadata must be provided as XML; URL-based fetching is not yet supported.
-//!     idp_metadata: IdpMetadata::Xml("<EntityDescriptor>...</EntityDescriptor>".to_string()),
-//!     sp_certificate: None,
-//!     sp_private_key: None,
-//!     contact_person: None,
-//!     allow_unsigned_assertions: false,
-//!     required_attributes: vec![],
-//! };
+//!     IdpMetadata::Xml("<EntityDescriptor>...</EntityDescriptor>".to_string()),
+//! );
 //!
+//! // Multi-instance deployments: `.with_replay_cache(shared_cache)`.
 //! let provider = SamlServiceProvider::new("my-sp".to_string(), config)?;
 //!
-//! // Generate SAML auth request
+//! // Generate SAML auth request; store `request_id` (and `relay_state`) in
+//! // the user's session.
 //! let auth_request = provider.create_auth_request()?;
-//! println!("SAML Request: {}", auth_request.saml_request);
+//!
+//! // On the ACS callback: correlated validation + replay protection.
+//! # let (saml_response, received_relay) = (String::new(), None::<String>);
+//! let assertion = provider
+//!     .validate_response(
+//!         &saml_response,
+//!         &auth_request.request_id,
+//!         auth_request.relay_state.as_deref(),
+//!         received_relay.as_deref(),
+//!     )
+//!     .await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -159,21 +175,24 @@ pub mod strategy;
 pub mod two_factor;
 pub mod user;
 
-pub use api_key::{ApiKey, ApiKeyError, ApiKeyManager, ApiKeyStore};
+pub use api_key::{ApiKey, ApiKeyError, ApiKeyManager, ApiKeyStore, GeneratedApiKey};
 pub use error::{AuthError, Result};
 pub use guard::{AuthGuard, Guard, PermissionGuard, RoleGuard};
-pub use middleware::JwtAuthMiddleware;
-pub use oauth2::{OAuth2Provider, OAuth2Token, OAuth2UserInfo};
+pub use middleware::{JwtAuthMiddleware, RejectedCredentials};
+pub use oauth2::{OAuth2Provider, OAuth2Token, OAuth2UserInfo, PendingAuth};
 pub use password::{PasswordHasher, PasswordVerifier};
-pub use passwordless::{MagicLinkToken, PasswordlessError, WebAuthnManager};
+pub use passwordless::{
+    InMemoryMagicLinkStore, IssuedMagicLink, MagicLinkStore, MagicLinkToken, PasswordlessError,
+    WebAuthnManager, redeem_magic_link,
+};
 #[cfg(feature = "saml")]
 pub use saml::{
-    ContactInfo, IdpMetadata, SamlAssertion, SamlAuthRequest, SamlConfig, SamlProvider,
-    SamlServiceProvider,
+    AssertionReplayCache, ContactInfo, IdpMetadata, InMemoryReplayCache, SamlAssertion,
+    SamlAuthRequest, SamlConfig, SamlProvider, SamlServiceProvider,
 };
 pub use strategy::{AuthStrategy, JwtStrategy, LocalStrategy};
 #[cfg(feature = "two-factor")]
-pub use two_factor::{BackupCodes, TotpSecret, TwoFactorError};
+pub use two_factor::{BackupCodes, GeneratedBackupCodes, TotpSecret, TwoFactorError};
 pub use user::{AuthUser, UserContext};
 
 // Re-export providers
@@ -285,11 +304,11 @@ impl Default for AuthService {
 /// ```
 pub mod prelude {
     pub use crate::AuthService;
-    pub use crate::api_key::{ApiKey, ApiKeyManager, ApiKeyStore};
+    pub use crate::api_key::{ApiKey, ApiKeyManager, ApiKeyStore, GeneratedApiKey};
     pub use crate::error::{AuthError, Result};
     pub use crate::guard::{AuthGuard, Guard, PermissionGuard, RoleGuard};
-    pub use crate::middleware::JwtAuthMiddleware;
-    pub use crate::oauth2::{OAuth2Provider, OAuth2Token, OAuth2UserInfo};
+    pub use crate::middleware::{JwtAuthMiddleware, RejectedCredentials};
+    pub use crate::oauth2::{OAuth2Provider, OAuth2Token, OAuth2UserInfo, PendingAuth};
     pub use crate::password::{PasswordHasher, PasswordVerifier};
     pub use crate::strategy::{AuthStrategy, JwtStrategy, LocalStrategy};
     pub use crate::user::{AuthUser, UserContext};
@@ -301,10 +320,21 @@ pub mod prelude {
     };
 
     #[cfg(feature = "saml")]
-    pub use crate::saml::{SamlConfig, SamlProvider, SamlServiceProvider};
+    pub use crate::saml::{
+        AssertionReplayCache, InMemoryReplayCache, SamlConfig, SamlProvider, SamlServiceProvider,
+    };
 
     #[cfg(feature = "two-factor")]
-    pub use crate::two_factor::{BackupCodes, TotpSecret, TwoFactorError};
+    pub use crate::two_factor::{BackupCodes, GeneratedBackupCodes, TotpSecret, TwoFactorError};
+}
+
+/// Secrets shared by this crate's unit tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// Passes `armature_jwt::config::validate_hmac_secret`.
+    pub const TEST_JWT_SECRET: &str = "kV9pQ2xR7tW4yZ1bN6mC3fH8jL5sD0gA";
+    /// A second, different valid secret.
+    pub const OTHER_TEST_JWT_SECRET: &str = "Xw3Ee8Rr1Tt6Yy9Uu2Ii5Oo0Pp7Aa4Ss";
 }
 
 #[cfg(test)]

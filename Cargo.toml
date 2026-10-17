@@ -1,6 +1,6 @@
 [package]
 name = "armature-auth"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.94.1"
 autobenches = false  # Disable auto-discovery, use explicit [[bench]] only
@@ -13,9 +13,9 @@ keywords = ["auth", "authentication", "authorization", "oauth"]
 categories = ["web-programming", "authentication"]
 
 [dependencies]
-armature-core = { version = "0.10" }
-armature-jwt = { version = "0.4" }
-armature-log = { version = "0.2" }
+armature-core = { version = "0.11" }
+armature-jwt = { version = "0.5" }
+armature-log = { version = "0.3" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
@@ -25,10 +25,15 @@ argon2 = "0.6"
 rand = "0.10"
 base64 = "0.23"
 
-# OAuth2 support - using rustls for TLS (no openssl)
+# OAuth2 support. oauth2's own (reqwest 0.12) HTTP client is disabled: token
+# requests go through this crate's reqwest 0.13 client (rustls, redirects
+# disabled so a 307/308 cannot re-send the client secret elsewhere).
 # Note: 5.0.0-rc.1 has minimal-versions compatibility issues with serde
-oauth2 = "5.0.0"
+oauth2 = { version = "5.0.0", default-features = false }
 reqwest = { version = "0.13", features = ["json", "rustls"], default-features = false }
+# OIDC id_token verification (JWKS). aws-lc-rs backend, like armature-jwt: the
+# RustCrypto backend pulls `rsa` (Marvin timing side channel).
+jsonwebtoken = { version = "11.0", default-features = false, features = ["use_pem", "aws_lc_rs"] }
 url = "2.5"
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 
@@ -52,6 +57,8 @@ quick-xml = { version = "0.42", features = ["serialize"], optional = true }  # U
 dashmap = "6.2"
 uuid = { version = "1.26", features = ["v4"] }
 sha2 = "0.11"
+hmac = "0.13"
+subtle = "2.6"
 hex = "0.4"
 
 [features]
