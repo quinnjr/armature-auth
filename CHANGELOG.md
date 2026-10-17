@@ -9,6 +9,8 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-17
+
 ### Security
 
 - **Guards fail closed (Breaking).** `AuthGuard` now requires a verified `UserContext` extension (attached by `JwtAuthMiddleware`); a bare `Authorization: Bearer …` header no longer passes. `RoleGuard`/`PermissionGuard` no longer consult the header at all, and an empty requirement (`RoleGuard::any(vec![])`, `PermissionGuard::any(vec![])`) now means "any authenticated caller" instead of "allow". Missing identity is `AuthError::Unauthorized`; insufficient role/permission stays `Forbidden`. Migration: register `JwtAuthMiddleware` ahead of guarded routes.
